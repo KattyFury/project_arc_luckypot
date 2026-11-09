@@ -1,0 +1,1580 @@
+# HANDOFF – LuckyPot
+
+> No-loss weekly USDC prize pool trên Arc. Gộp tiền gửi của nhiều người vào 1
+> pool, mỗi tuần quay số ngẫu nhiên trao toàn bộ yield của tuần đó cho một vài
+> người, thay vì chia đều lãi cho tất cả. Không ai mất gốc — rút lại 100% USDC
+> đã gửi bất cứ lúc nào.
+
+**Repo:** https://github.com/KattyFury/LuckyPot (đổi tên từ `LuckyStaker` → `LuckyPot` ngày 2026-08-24, đổi thương hiệu — repo cũng đã chuyển **Private** cùng ngày vì user chưa muốn lộ dự án sớm)
+**Web đang chạy:** https://luckypot.cc (custom domain gắn vào Cloudflare Pages project `luckypot`) — landing page ở root, dashboard ở `/app`. **KHÔNG** auto-deploy từ GitHub. Project Cloudflare cũ `luckystaker`/`stableluck` vẫn còn tồn tại nhưng ngừng cập nhật.
+🔴 **Deploy PHẢI chạy từ GỐC REPO, không phải từ `frontend/`** — xem cảnh báo đầy đủ + lệnh
+đúng ở mục "Lệnh hay dùng" (`cd .. && npx wrangler pages deploy frontend/dist-site
+--project-name=luckypot --branch=main --commit-dirty=true`, hoặc đơn giản nhất: `npm run
+deploy` từ `frontend/`). Chạy `wrangler pages deploy dist-site` khi cwd đang ở `frontend/` sẽ
+**KHÔNG** upload Functions (`functions/` nằm ở gốc repo, wrangler tìm theo cwd) — toàn bộ
+`/api/*` âm thầm rớt về static fallback (trả HTML/404/405 tuỳ endpoint) dù `wrangler` vẫn báo
+"Deployment complete!" bình thường, không có lỗi nào hiện ra. Đã xảy ra thật 2 lần (xem mục
+"Deploy sai thư mục làm sập toàn bộ /api/\*" bên dưới) — **luôn kiểm tra output deploy có dòng
+"✨ Compiled Worker successfully" / "Uploading Functions bundle" hay không**, thiếu 2 dòng đó là
+sai ngay lập tức, đừng đợi user báo bug mới biết.
+⚠️ **Contract Solidity CỐ Ý giữ nguyên tên `LuckyStakerPool`** dù sản phẩm tên LuckyPot — spec không yêu cầu tên contract khớp tên sản phẩm. Mọi chỗ trong repo nhắc tới `LuckyStakerPool.sol` / `LuckyStakerPool (proxy)` là tên kỹ thuật thật, không phải sai sót quên đổi.
+⚠️ **Proxy đã đổi địa chỉ ngày 2026-08-31 — deploy lại từ đầu, KHÔNG phải cùng contract cũ.**
+Proxy hiện tại: **`0xBdE568986a009eBaAE31Cb78033470c334Fad698`** (deploy block `59715964`).
+Proxy CŨ `0x88dCB2f36356AA8DADdC2e8fb4A3E122Ba9D0Beb` vẫn tồn tại trên chain nhưng **đã bỏ
+hẳn** — đừng nhầm khi tra cứu lịch sử/lệnh cũ trong chat trước ngày này. Lý do & chi tiết đầy
+đủ ở mục "Deploy lại từ đầu" bên dưới.
+**Spec gốc:** [`arc-prize-pool-spec.md`](./arc-prize-pool-spec.md) — đã có trong repo, encoding sạch
+**Database:** Cloudflare D1 `luckypot-history` (đọc qua binding `HISTORY_DB` khai báo trong
+`wrangler.toml` ở gốc repo, ghi bởi `automation/src/indexHistory.ts` chạy trên lịch cron có
+sẵn của `keeper.yml`) — lưu lịch sử Deposited/Withdrawn/Won/Claimed cho "My history". `Won` ghi
+ngay lúc event `Drawn` bắn (gross prize, trước khi claim), `Claimed` ghi lúc `Claimed`/`Swept`
+bắn (net, sau 5% referral cut) — 2 dòng riêng, xem mục "Won ghi vào history ngay lúc quay" bên
+dưới. Chi tiết đầy đủ ở mục "My history chuyển sang D1" bên dưới.
+**Ngôn ngữ:** toggle **EN|VI** ở navbar (cạnh Enter App/Connect Wallet), dịch toàn bộ landing +
+app **trừ** `AdminPage.tsx` (tool nội bộ) và **trừ** giá trị countdown (`formatCountdown`, "4d
+16h 10m 28s" — chủ ý giữ nguyên, chỉ nhãn "Draw in"/"Quay số sau" quanh nó mới dịch). Xem mục
+"Thêm toggle EN|VI" bên dưới.
+
+---
+
+## Trạng thái nghỉ 2026-09-11 — Slogan mới + fix cào thẻ hiện $0 + fix số dư không tự cập nhật
+
+Phiên này làm 3 việc riêng biệt, đã commit tách 3 (`7d10a67`, `c8c4a9f`, `88d582b`) và **push lên
+`main` rồi**.
+
+**1. Slogan "Your idle money can become lottery tickets – for free"** — thêm vào
+`README.md` (blockquote ngay dưới câu mô tả đầu), `frontend/landing/index.html` (dòng "kicker"
+màu xanh primary phía TRÊN h1 hero, cả EN lẫn VI qua dictionary `heroKicker`), và GitHub repo
+description. **Không** sửa H1 gốc của hero — code đã có comment ghi rõ đó là "dòng quan trọng
+nhất trang, đừng để gì tranh chỗ" — nên slogan chỉ đóng vai trò câu mồi phía trên, không thay thế.
+
+**2. Bug: cào thẻ hiện "You win 0 USDC (Prize already claimed)" dù trúng thật** —
+`frontend/src/components/ResultModal.tsx`. Root cause: `owedTo()`/`_payoutOwed()` bên contract
+trả về 0 **ngay khi `e.claimed[user] == true`** — đúng bản chất của nó là "còn nợ bao nhiêu",
+nhưng ResultModal lại tái dùng chính số đó để hiển thị **số đã thắng**. Vì `sweep()` permissionless
+sau 3 ngày tự set `claimed=true` và trả tiền hộ, bất kỳ ai bị/được sweep trước khi tự tay cào thẻ
+sẽ thấy "$0" vĩnh viễn dù tiền đã nằm trong ví thật từ trước — tức cơ chế tự động trả thưởng (rất
+tốt cho tiền) lại vô tình xoá luôn niềm vui "biết mình trúng" của người chơi. Fix: bỏ hẳn lệ thuộc
+vào `owedTo`, tính lại số đã thắng ở client từ `epoch.winners` + `prizeForRank()` — hàm pure có
+sẵn ở `frontend/src/lib/prize.ts` (đã dùng trong `EpochDetailModal.tsx`, chỉ tái dùng chứ không
+viết logic mới), không phụ thuộc trạng thái claimed nên luôn đúng bất kể đã sweep hay chưa.
+
+**3. "Số dư cập nhật quá chậm, gần như không cập nhật"** — không phải bug logic: deposit/withdraw
+đã có `useCloseOnSuccess` gọi `queryClient.invalidateQueries()` refetch ngay khi tx confirm, từ
+trước phiên này rồi. Root cause thật: đợt fix RPC-429 trước đó (mục "RPC 429" bên dưới) tắt
+`refetchOnWindowFocus` **toàn cục** trên `QueryClient` để tránh bão request mỗi lần refocus tab —
+nhưng vô tình giết luôn đúng khoảnh khắc user hay để ý số dư nhất: vừa deposit/withdraw, qua ví
+confirm, quay lại tab xem kết quả. Từ đó chỉ còn 1 cơ chế cập nhật thụ động cho những thay đổi
+KHÔNG do hành động của chính mình (người khác gửi/rút, ai đó sweep hộ, keeper tự quay số): poll
+15s (`BALANCE_POLL_MS` trong `frontend/src/hooks/usePoolData.ts`). Fix: bật lại
+`refetchOnWindowFocus: true` **chỉ** cho 2 hook `usePoolTotals`/`useUserPosition` — mỗi hook vẫn
+chỉ tốn đúng 1 multicall gộp khi refocus, không phải "bắn cả dashboard" như bug cũ đã fix.
+
+**Đã verify thật, không chỉ đọc code:**
+- `npx tsc -b --noEmit` sạch, `npm run build` pass.
+- Dựng dev server thật với `VITE_POOL_ADDRESS` = proxy thật đang chạy
+  (`0xBdE568986a009eBaAE31Cb78033470c334Fad698`), bỏ trống `VITE_PRIVY_APP_ID` (`USE_PRIVY` tự
+  fallback về wagmi/MetaMask connector, không cần đăng ký Privy để test đọc dữ liệu) — Playwright
+  chụp thật dashboard, thấy đúng số liệu on-chain (5,732/6,837 USDC, 14 depositors, epoch #03...),
+  không lỗi console, không request nào 4xx/5xx.
+- Test riêng cho fix #3: kịch bản refocus thật bằng Playwright (mở tab khác, đợi >10s cho data
+  qua `staleTime`, quay lại tab) — xác nhận có 3 request RPC mới bắn ra ngay lập tức lúc refocus,
+  đúng hành vi kỳ vọng (trước fix sẽ là 0, phải đợi hết nốt vòng poll 15s).
+- Trước khi push đã revert `frontend/package-lock.json` (bị `npm install` cục bộ sửa do prune
+  optional peer deps không liên quan, không phải thay đổi cố ý).
+
+**Việc KHÔNG làm trong phiên này** (không được yêu cầu, không tự ý đụng): quyền admin vẫn đang là
+2-of-2 Safe + 1 EOA ngang quyền (xem mục "Tightening" ở đầu file / `PROJECT.md`) — user hẹn tự tay
+chuyển hẳn sang multisig-only quanh 2026-09-10/11, chưa thấy xác nhận đã làm.
+
+**Quyết định đang chờ build (KHÔNG code hôm nay — hôm nay là ngày thiết trình, user chủ động
+hoãn):** user muốn đổi cơ chế quét thưởng, thấy chờ 3 ngày (`SWEEP_DELAY`, `claim()`/`sweep()`)
+bất hợp lý vì có người bận tới giữa tuần mới vào xem được. Giờ bug "cào thẻ hiện $0 khi đã bị
+sweep" đã fix (mục #2 phía trên — ResultModal tính số thắng độc lập `claimed`), quét sớm không
+còn giết niềm vui cào thẻ nữa, nên mở lại được câu hỏi này. 2 hướng đã bàn, **chưa chọn hướng
+nào**:
+- **A. Kéo dài cửa sổ claim/sweep** — vẫn giữ nguyên model pull (claim/sweep), chỉ đổi hằng số
+  `SWEEP_DELAY` (contract, dòng ~36) từ `3 days` lên gần hết tuần (vd `6 days 23 hours`, hoặc đổi
+  hẳn logic gate sweep theo "epoch kế tiếp đã quay xong" thay vì đếm giờ cứng). Rủi ro thấp, chỉ
+  cần redeploy implementation + upgrade proxy qua Safe, không đổi kiến trúc.
+- **B. Auto-push tiền ngay lúc có kết quả** — `revealAndDraw()` tự chuyển tiền cho từng winner
+  luôn, bỏ hẳn bước chờ. Rủi ro: `revealAndDraw()` hiện KHÔNG có transfer nào; nếu thêm vòng lặp
+  `_settle()` ngay trong đó mà không bọc `try/catch`, 1 winner bị lỗi transfer sẽ làm **sập cả
+  giao dịch quay số của TẤT CẢ người tham gia epoch đó** (cả hàm chung 1 tx, `nonReentrant`). Cần
+  fallback y như referral cut đã có (`pendingRef`) để 1 ví lỗi không kẹt cả draw. Đổi kiến trúc
+  nhiều hơn, cần test kỹ hơn A.
+
+Khuyến nghị: làm A trước (an toàn, ít đổi), để B lại nếu sau này thật sự muốn bỏ hẳn mô hình
+claim/sweep. Việc này **độc lập với `forceEndEpoch()`** (câu hỏi ban đầu của user) — sửa
+`SWEEP_DELAY` không phụ thuộc epoch đang chạy dở, làm trước/sau `forceEndEpoch()` đều được.
+
+---
+
+## Sự cố 2026-09-09 (đêm) — Deploy sai thư mục làm sập toàn bộ /api/\* production ~3 tiếng
+
+**Điều đã xảy ra:** cả 2 lần deploy trong phiên hôm nay (sau khi fix My History, và sau khi
+thêm toggle EN|VI) đều chạy `cd frontend && npx wrangler pages deploy dist-site
+--project-name=luckypot --branch=main` — copy y nguyên theo dòng "Web đang chạy" ở đầu file
+này (dòng đó lúc đó vẫn ghi lệnh SAI, xem sửa lại ở trên). Cả 2 lần `wrangler` đều báo
+"✨ Deployment complete!" bình thường, KHÔNG có dấu hiệu lỗi nào. Nhưng vì chạy từ `frontend/`
+thay vì gốc repo, `wrangler` không tìm thấy thư mục `functions/` (nằm ở gốc repo) nên **không hề
+bundle bất kỳ Cloudflare Pages Function nào** — output không có dòng "Compiled Worker
+successfully"/"Uploading Functions bundle" (điều tôi lúc đó không để ý kiểm tra).
+
+**Hậu quả thật trên production** (không phải giả định): mọi route `/api/*`
+(`/api/history`, `/api/referrals`, `/api/swap`) rớt về static-fallback của Cloudflare Pages —
+GET trả nhầm HTML của landing page (status 200 nhưng sai nội dung, "My history" trong app đọc
+phải HTML rồi lỗi ngầm), POST/OPTIONS trả **405** (static handler không nhận method khác GET).
+User bắt được qua console lỗi `405` khi bấm nút bán EURC/cirBTC. Sự cố kéo dài từ lúc deploy đầu
+tiên (~15h30) tới lúc phát hiện + sửa (~16h55) — khoảng **~3 tiếng "My history" và nút bán đều
+âm thầm hỏng trên production thật**, không phải trên bản test.
+
+**Bài học cay nhất:** đúng gotcha này **đã được 1 phiên trước ghi lại y hệt, chi tiết, kèm cả
+triệu chứng `/api/swap` 405**, nằm sẵn trong mục "Lệnh hay dùng" phía dưới — nhưng nằm ở dòng
+1400+ của file 1500+ dòng, còn dòng "Web đang chạy" ở ĐẦU file (thứ đọc đầu tiên mỗi lần login)
+lại ghi lệnh SAI. Tôi đọc dòng đầu, tin luôn, không grep lại toàn file tìm cảnh báo deploy trước
+khi chạy. **Đã sửa: đưa cảnh báo lên đầu file (dòng "Web đang chạy"), không chỉ chôn ở mục lệnh
+hay dùng nữa** — một file HANDOFF chỉ hữu ích nếu cảnh báo quan trọng nhất nằm ở chỗ chắc chắn
+được đọc, không phải chỗ đúng-về-mặt-kỹ-thuật-nhưng-không-ai-lướt-tới.
+
+**Đã fix:** redeploy lại đúng cách từ gốc repo (`cd luckypot && npx wrangler pages deploy
+frontend/dist-site --project-name=luckypot --branch=main --commit-dirty=true`) — output lần này
+CÓ "✨ Compiled Worker successfully" + "Uploading Functions bundle". Verify lại bằng curl thật:
+`/api/history` trả đúng JSON, `/api/swap` OPTIONS trả 200 đúng CORS header, POST trả 500 đúng
+kiểu lỗi thật của `swap.js` (test bằng ví rác nên Circle Stablecoin Kit từ chối — không phải
+405 nữa). Không cần rollback gì thêm vì không có tx/tiền nào bị ảnh hưởng, chỉ là 2 tính năng
+đọc/gọi API bị gãy tạm thời.
+
+---
+
+## Trạng thái nghỉ 2026-09-09 (tối) — thêm toggle EN|VI cho landing + app
+
+User yêu cầu 2 việc: (1) toggle EN|VI cạnh nút Enter App/Connect Wallet, dịch cả trang, riêng
+countdown giữ nguyên; (2) nhân tiện chỉnh lệch icon info (đã làm ở mục ngay dưới, cùng phiên).
+
+**Kiến trúc React app** (`frontend/src/i18n/`):
+- `en.ts` — dictionary gốc, tất cả string/hàm string thuần (KHÔNG chứa JSX — style/`<strong>`
+  vẫn nằm ở component, dictionary chỉ trả text để tránh trùng lặp style object).
+- `vi.ts` — cùng shape, ép kiểu bằng `satisfies typeof en` nên thiếu key là lỗi biên dịch, không
+  bao giờ âm thầm rơi về tiếng Anh.
+- `LanguageContext.tsx` — context React y hệt pattern `TokenUnitProvider` có sẵn (`config/
+  tokenUnit.tsx`), persist vào `localStorage` key **`luckypot:lang`**.
+- `useT()` trả nguyên dictionary của ngôn ngữ đang chọn; mọi component gọi `const t = useT()`.
+- Câu có số/chữ đậm chen giữa (VD "This week's yield goes to **3** winners out of **50**
+  players...") được tách thành nhiều key nhỏ (`summaryBefore`/`summaryMiddle`/`summaryAfter`)
+  đúng y cách JSX gốc đã tách bằng `{" "}`, KHÔNG viết JSX trong dictionary.
+- Số ít/nhiều tiếng Anh (`plural()` cũ) thay bằng hàm `t.common.winnerWord(n)` kiểu — tiếng Việt
+  không chia số nên hàm VI bỏ qua tham số, nhưng vẫn giữ chữ ký `(n) => string` để 2 ngôn ngữ
+  dùng chung 1 call site.
+- Ngày trong "My history" (`MyHistoryCard.tsx`) đổi theo `t.common.dateLocale` (`en-US`/`vi-VN`)
+  — số tiền/USDC thì CỐ Ý giữ nguyên định dạng en-US ở cả 2 ngôn ngữ (quy ước phổ biến khi hiển
+  thị stablecoin USD trong app crypto Việt, tránh gây hiểu lầm dấu phẩy/chấm).
+- `entry.type` (`"Won"`/`"Claimed"`/...) là GIÁ TRỊ DỮ LIỆU từ D1, không đổi — chỉ hiển thị qua
+  `t.myHistory.typeLabels[entry.type]`, so sánh logic (`=== "Won"`) vẫn dùng string gốc.
+- `ScratchCanvas.tsx` vẽ chữ "Scratch to reveal" bằng Canvas 2D `fillText` (không phải DOM text)
+  nên không tự đổi ngôn ngữ qua CSS/props re-render — thêm prop `prompt`, `ResultModal.tsx`
+  truyền `t.scratch.prompt` vào lúc mount. Chưa xử lý trường hợp đổi ngôn ngữ NGAY khi canvas
+  đang mở (hiếm, chấp nhận được).
+- **Cố ý bỏ qua `AdminPage.tsx`** — tool nội bộ, không có giá trị dịch, giữ nguyên tiếng Anh để
+  không tốn công vô ích. Nếu sau này cần dịch thì làm riêng, không nằm trong scope lần này.
+
+**Landing page** (`frontend/landing/index.html`, HTML/JS thuần, không qua Vite build):
+- Dictionary song song viết tay bằng JS thuần (`LANG.en`/`LANG.vi`), áp dụng qua `el.innerHTML`
+  (không phải `textContent`) để giữ nguyên `<strong>`/`<code>` trong vài đoạn.
+- Toggle dùng chung `localStorage` key `luckypot:lang` với app React — chọn ngôn ngữ ở 1 nơi thì
+  nơi kia cũng nhớ, dù 2 trang không chung 1 lần build.
+- Style pill toggle copy tay từ `.token-toggle` trong `global.css` (landing không import CSS của
+  app, phải tự chép — đã ghi rõ trong comment).
+- Live-stat (`Total pool`/`Last winner`/...) đọc thẳng từ chain qua 1 script `type="module"`
+  riêng — phần chữ tĩnh dịch qua `data-i18n`, còn 2 fallback "no winner"/"–" nằm trong dữ liệu
+  fetch async nên phải tách riêng: lưu kết quả fetch vào biến `lastResult`, expose hàm
+  `window.__renderLiveStats()` để toggle gọi lại render đúng ngôn ngữ mới mà KHÔNG cần fetch lại
+  chain.
+
+**Thuật ngữ tiếng Việt bám theo cách chính user đã viết về dự án này** (PROJECT.md/HANDOFF.md
+tiếng Việt sẵn có) — "gửi tiền"/"rút tiền" chứ không dịch cứng "deposit"/"withdraw", "kỳ" cho
+epoch, giữ nguyên "pool" như từ mượn (đúng cách PROJECT.md tự dùng).
+
+**Đã verify bằng screenshot thật** (Chrome headless), KHÔNG chỉ đọc code — cả landing lẫn app,
+cả 2 ngôn ngữ, xác nhận: toggle đổi đúng, countdown "0d 0h 0m 0s" giữ nguyên không dịch, chữ có
+`<strong>` không bị vỡ định dạng khi đổi ngôn ngữ. Gate check: grep toàn bộ file đã sửa tìm chuỗi
+tiếng Anh cứng còn sót — sạch, không có JSX text node nào lọt lưới.
+
+Build + deploy `luckypot.cc` thành công. Đã commit + push (`de13cca`).
+
+---
+
+## Trạng thái nghỉ 2026-09-09 (chiều) — "Won" ghi vào history ngay lúc quay, sửa lệch info icon
+
+User báo "My history vẫn lỗi, chưa thấy hiện lịch sử" + muốn kết quả đã cào ra phải lưu vào
+lịch sử ngay. API/D1 backend thật ra **chạy đúng** (test trực tiếp `curl luckypot.cc/api/history`
+cho nhiều ví đều ra kết quả đúng) — bug thật là **kiến trúc**: `history` table chỉ ghi dòng
+`"Won"` khi event `Claimed`/`Swept` bắn ra (tiền đã thật sự rời contract). Người trúng mà chưa
+bấm Claim thì "My history" đúng là trống trơn về phần thắng đó — không phải lỗi hiển thị, mà là
+chưa từng được ghi. Cào thẻ (`scratchState.ts`) chỉ là animation lưu `localStorage`, không phải
+tx on-chain, nên không thể dùng làm trigger ghi — phải bám vào event `Drawn` (epochId, winners[],
+weeklyYield, resultHash) mới đúng và bền (server-side, không phụ thuộc trình duyệt nào).
+
+**Đã sửa (`automation/src/indexHistory.ts`):** thêm decode event `Drawn`, tự tính lại
+`prizeForRank` y hệt contract (rank 0 = jackpot, còn lại chia đều) để biết prize GROSS của từng
+người trúng ngay từ event này — không cần gọi lại contract. Ghi 1 dòng `"Won"` cho mỗi winner tại
+đúng lúc quay số. Event `Claimed`/`Swept` sau đó đổi tên dòng ghi từ `"Won"` (cũ) sang **`"Claimed"`**
+(net, sau 5% referral cut) — 2 dòng riêng biệt kể đủ câu chuyện 1 lần trúng (trúng bao nhiêu lúc
+quay, nhận về tay bao nhiêu lúc claim) thay vì đè lên nhau.
+
+⚠️ **Đổi PK bảng `history`:** 1 log `Drawn` có thể liệt kê NHIỀU ví trúng khác nhau — khoá cũ
+`(tx_hash, log_index)` không đủ phân biệt (dòng thứ 2 trở đi bị `INSERT OR IGNORE` âm thầm bỏ
+qua). Đổi PK sang **`(tx_hash, log_index, wallet)`**, đã migrate bảng `luckypot-history` sống trên
+D1 (tạo bảng mới → copy → drop → rename → tạo lại index), verify đủ 27→27 dòng không mất dữ liệu.
+Cùng ví trúng 2 rank trong 1 lần quay (hiếm nhưng có thể) được gộp cộng dồn thành 1 dòng trước khi
+insert, tránh trùng PK.
+
+**Verify KHÔNG chỉ đọc code:** tự viết script tạm decode thật event `Drawn` của epoch 2
+(`0x14cc2275...`, block `60869340`) bằng viem, chạy `prizeForRank` y hệt bản mới viết — ra đúng
+**3173076 / 3173077** (gross), khớp 100% với số đã verify tay ở phiên trước (net sau cut là
+3014423/3014424). Đã chạy `npm run index-history` thật trên chain — sạch, không lỗi (không có
+`Drawn` mới nên chưa tạo dòng nào, nhưng code path không crash). Rows lịch sử cũ (2 dòng "Won" từ
+epoch 2, ghi trước khi sửa) giữ nguyên tên cũ — không backfill, chỉ áp dụng cho epoch tương lai vì
+`sync_state` đã lướt qua block cũ rồi, không quét lại.
+
+**Frontend:** `HistoryEntry.type` + `MyHistoryCard.tsx` thêm `"Claimed"`, cả `"Won"` lẫn `"Claimed"`
+đều tô xanh (positive), nhưng đếm số "win" ở header card chỉ tính `"Won"` (đúng số lần trúng thật,
+không đếm đúp lúc claim). Build + deploy `luckypot.cc` thành công.
+
+**Tiện tay sửa luôn:** icon info (ⓘ) cạnh số "0/0 USDC" bị lệch cao — do `align-self: center`
+canh giữa theo hàng có số fs-4 to, trong khi hàng dùng `align-items: baseline`. Đổi sang
+`align-self: baseline` + `top: 0.15em`. Verify bằng screenshot Chrome headless zoom 3x trước/sau,
+gửi ảnh ra Desktop cho user — không đoán mù CSS.
+
+---
+
+## Trạng thái nghỉ 2026-09-09 — fix false-alarm keeper timeout, kiểm toán toàn dự án trước live
+
+User báo `keeper.yml` đỏ (job `fund-yield`, 3m18s). Đào log: `WaitForTransactionReceiptTimeoutError`
+ở `fundYield.ts` sau đúng 180s (default timeout của viem, không phải do code set). Verify thẳng
+on-chain bằng `eth_getTransactionReceipt`: tx `0x20d3a458...` **status success**, pot đã được fund
+đúng — tx chỉ kẹt mempool bất thường lâu (~52 phút, so khớp block timestamp vs lúc gửi), không
+phải chain đứng (block vẫn ra đều ~1s/block suốt lúc đó) và không phải do phí thấp (maxFeePerGas
+gửi lúc đó ~1376 gwei, cao hơn nhiều so với gas price hiện hành ~20 gwei). Kết luận: **false alarm
+thuần, không mất tiền, không cần retry logic** — script `fundYield.ts` vốn đã tự "self-healing"
+(tính lại `pendingYield` on-chain mỗi lần chạy, không cộng dồn sai dù 1 lần fail).
+
+**Fix (`automation/src/client.ts`):** `waitForSuccess()` — hàm dùng chung cho MỌI tx gửi đi
+(`draw.ts`/`drawNow.ts`/`fundYield.ts`/`sweep.ts`) — thêm `timeout: 600_000` (10 phút thay vì
+180s mặc định của viem) vào `waitForTransactionReceipt`, kèm comment giải thích vụ 52 phút này để
+lần sau khỏi tưởng nhầm là bug thật. Đã `npm install` (tiện tay sync lại `package-lock.json` còn
+sót tên cũ `@luckystaker/automation` từ hồi rebrand — package.json đã đúng `@luckypot` từ lâu,
+lockfile thì chưa) + `npx tsc --noEmit` sạch. **Đã commit + push cả 2** (`6836bca`, `871a30b`).
+
+### Kiểm toán toàn dự án (user yêu cầu, "sắp live rồi không muốn sơ suất")
+
+Đọc trọn `LuckyStakerPool.sol` (722 dòng), toàn bộ `automation/src`, `functions/api/*` +
+`schema.sql`, đối chiếu với `PROJECT.md`/`HANDOFF.md` sẵn có rồi verify lại bằng RPC call thật
+(không tin docs cũ) — không phải chỉ đọc code suông.
+
+**🔴 Xác nhận LIVE ngay lúc kiểm tra (`hasRole` gọi trực tiếp on-chain), không chỉ suy từ docs:**
+ví đơn `0xb0ea48A1979326BA9e0b5027D105C8DF9CCAA12E` hiện giữ **CẢ** `DEFAULT_ADMIN_ROLE` **VÀ**
+`KEEPER_ROLE` cùng lúc, song song với Safe 2-of-2 (`0x0f5514fCA...`). Đây chính là việc
+`PROJECT.md` mục 10.4 đã liệt là điều kiện "sẵn sàng thật" — tính đến giờ **vẫn chưa dọn**.
+**User đã trả lời khi nghe báo cáo: "mai hoặc mốt anh chuyển qua multi sig rồi yên tâm"** — tự
+làm, KHÔNG nhờ Claude dựng nút revoke trên `/app/admin` (đã hỏi, user từ chối, chỉ muốn ghi
+nhận). Nhớ verify lại bằng `hasRole` on-chain ở phiên sau trước khi coi là đã xong, đừng tin lời
+kể hay docs cũ.
+
+**🟠 Đã biết từ trước, nhắc lại vì vẫn mở, không phát hiện mới:**
+- `forceEndEpoch`/`forceSweepReady` dùng chung `KEEPER_ROLE` với automation thật → không revoke
+  riêng được (đã ghi ở mục "Deploy lại từ đầu" bên dưới, việc 7).
+- Vòng lặp `participants` không giới hạn trong `revealAndDraw`/`forceWithdrawAll` → gas scale
+  theo tổng số ví từng gửi tiền, có thể vượt block gas limit khi pool đông (mục "Giới hạn kỹ
+  thuật đã biết" #8 trong `PROJECT.md`).
+- Randomness commit-reveal + `blockhash`, không phải VRF (roadmap đã có mục VRF migration).
+
+**🟡 Phát hiện mới, mức độ thấp:** `functions/api/swap.js` không rate-limit/check Origin — ai
+cũng spam gọi được để đốt quota `KIT_KEY` (Circle API), không lấy được tiền (chỉ trả quote, ký
+vẫn cần ví thật). Chưa fix, chưa được yêu cầu fix.
+
+**✅ Sạch:** mọi query D1 đều dùng `.bind()` (không SQL injection), reentrancy guard +
+checks-effects-interactions đúng chuẩn xuyên suốt, không tìm thấy lỗ hổng mất-tiền mới nào
+ngoài 2 điều đã biết ở trên.
+
+---
+
+## Trạng thái nghỉ 2026-09-07 (trưa) — sweep() "permissionless" chứ chưa từng "tự động"
+
+User sắp thuyết trình, nhờ rà lại quy luật "sau 3 ngày không claim thì tự động bắn tiền
+về ví người thắng" trước khi lên demo. Logic `sweep()` on-chain **đúng, không bug**
+(`require(block.timestamp >= e.drawnAt + SWEEP_DELAY)`, loop `e.winners`, skip người đã
+claim, settle đúng người đúng tiền) — nhưng phát hiện lỗ hổng thật: **`sweep()` chỉ
+"permissionless" (ai gọi cũng được), KHÔNG hề có ai/cái gì THỰC SỰ gọi nó cả.**
+Grep toàn bộ `automation/` + `keeper.yml` trước khi sửa: chỉ có 3 job
+`fund-yield`/`draw`/`index-history`, không job nào đụng tới `sweep`. Nghĩa là nếu người
+trúng không tự bấm Claim trong 3 ngày, tiền nằm im vĩnh viễn trong contract cho tới khi
+có người tự tay gọi `sweep()` qua admin page/Arcscan — **không tự động** như câu pitch
+đang nói.
+
+**Đã thêm `automation/src/sweep.ts`** (theo đúng pattern `draw.ts`: gas buffer 1.6x +
+`waitForSuccess` check status thật) + step **"Sweep unclaimed prizes past the 3-day
+window"** mới trong `keeper.yml`, chạy mỗi 6 tiếng như 3 job kia. Script quét TOÀN BỘ
+epoch đã quay (rẻ vì epoch theo tuần, vài chục epoch sau nhiều năm vẫn chỉ là vài lần
+đọc), epoch nào đã qua `drawnAt + 3 ngày` mà còn winner chưa claim mới thực sự gửi tx
+`sweep(epochId)` — epoch không cần sweep thì không tốn gas gì cả.
+
+Đã test local (`npm run sweep` bằng `automation/.env` thật, đọc chain thật): epoch 1
+(0 người trúng) và epoch 2 (2 người trúng, còn ~2.8 ngày nữa mới tới hạn) đều bị bỏ qua
+đúng như kỳ vọng, in "nothing to do" — **chưa test end-to-end 1 lần sweep thật xảy ra**
+(muốn test thật phải dùng `forceSweepReady` testnet-only, nhưng việc đó ép đóng sớm cửa
+sổ claim() của 2 người trúng thật của epoch 2 — CHƯA làm vì ảnh hưởng tới state thật,
+cần hỏi user trước).
+
+**Đã test end-to-end thật trên chain (user chọn force test ngay trước demo):**
+`forceSweepReady(2)` → `sweep(2)`, cả 2 tx `status: success`. Số dư USDC 2 ví trúng
+tăng đúng **chính xác tuyệt đối** theo công thức tính tay từ `prizeForRank` + 5%
+referral cut (`0x2442...ebc10`: 1.813195→4.827618, `0xe7d7...93c1`: 1.158905→4.173329),
+`hasClaimed` cả 2 chuyển `true`, `vaultReserve`/`vaultDev` tăng đúng phần cut
+(133846→292498 / 133847→292501). Gọi lại `sweep(2)` lần 2: `status: success` nhưng
+`logs: []` — xác nhận idempotent, không trả đúp. Script `sweep.ts` mới sau đó tự nhận
+ra "nothing to do" đúng như kỳ vọng. Cơ chế sweep giờ đã verify đúng thật trên chain,
+không chỉ đọc code — an toàn để đưa vào demo.
+
+⚠️ **Tác dụng phụ đã biết trước và chấp nhận:** 2 ví trúng epoch 2 giờ nhận tiền qua
+event `Swept` thay vì tự bấm Claim — không mất tiền, chỉ khác cơ chế nhận, y hệt UX
+thật nếu người dùng thật không claim kịp trong 3 ngày.
+
+---
+
+## Trạng thái nghỉ 2026-09-07 (sáng) — bug: epoch không xổ số, keeper báo xanh giả
+
+User báo thứ Hai sáng mà pool không quay số. Đào ra 2 lỗi lồng nhau:
+
+1. **`revealAndDraw` bị revert do hết gas (OOG)**, không phải do logic sai. Tx
+   `0xab835c9b352c4903095c1f18bcbe7bf6ec91103a3b32a2d4303e18d6395ac0e5` (run keeper
+   `34074954155`, 2026-09-07T02:02 UTC) dùng hết 416242/422392 gas — hàm này loop qua
+   TOÀN BỘ `participants` (hiện 14 ví) để settle/reset balance, chi phí scale theo số
+   người tham gia, và `eth_estimateGas` của RPC Arc Testnet ước lượng thiếu (viem
+   dùng đúng số RPC trả về, không tự thêm buffer). Trace (`cast run <tx>`) cho thấy tx
+   đã emit `Drawn` với 2 người trúng thật rồi mới OOG ở đoạn reset balance cuối hàm —
+   không phải bug logic hay sai secret.
+2. **`draw.ts` không kiểm tra `receipt.status`** — chỉ gọi `waitForTransactionReceipt`
+   rồi in "Drew epoch N" bất kể tx revert hay không. `fundYield.ts` có cùng lỗ hổng ở
+   cả `approve` lẫn `fundYield`. Hệ quả: GitHub Actions báo **success** dù draw thất
+   bại thật trên chain — không có cách nào nhận ra ngoài tự tra tx trên ArcScan.
+   Epoch revert thì rollback sạch state (vẫn `committed=true, drawn=false`, secret vẫn
+   còn nguyên trong cache Actions) nên không mất gì, nhưng sẽ kẹt vĩnh viễn ở lần
+   keeper chạy kế (6 tiếng/lần) vì cùng 1 gas limit lại tiếp tục thiếu.
+
+**Fix (`automation/src/`):**
+- Thêm `waitForSuccess(hash, label)` dùng chung trong `client.ts` — throw rõ ràng nếu
+  `receipt.status !== "success"`, áp dụng cho mọi tx gửi đi (`draw.ts`, `fundYield.ts`,
+  `drawNow.ts`) thay vì chỉ đợi receipt rồi coi như xong.
+- `revealAndDraw` (cả `draw.ts` lẫn `drawNow.ts`) giờ tự `estimateContractGas` rồi
+  nhân **1.6x** làm gas limit thật sự gửi lên, thay vì tin thẳng số RPC trả về — vì
+  chi phí hàm này tăng theo `participantCount` nên buffer tỉ lệ sẽ tự scale theo, không
+  hardcode 1 con số cố định dễ lỗi thời khi pool đông người hơn.
+
+**Chưa làm:** chưa merge/push + chưa trigger lại keeper để xổ epoch 2 — xem bước tiếp
+theo ngay dưới đây khi quay lại phiên.
+
+---
+
+## Trạng thái nghỉ 2026-08-31 (tối) — referral summary, sửa logo, admin layout + commit/reveal, banner đa số
+
+Tiếp nối phiên deploy lại từ đầu cùng ngày (mục ngay bên dưới). Contract KHÔNG đổi địa chỉ
+lần này — chỉ frontend/automation/D1.
+
+### 1. My referral — thêm bảng D1 mới, không chỉ đọc `pendingRef`
+
+Popup "Invite & Earn" (`ReferralInfoModal.tsx`) trước đó chỉ hiện link mời + số dư
+`pendingRef` chưa claim. Giờ thêm: **số người đã ref, tổng đã kiếm được (lifetime), danh
+sách từng ví kèm số tiền kiếm từ ví đó** — thêm mục "My referral" vào dropdown ví (giữa "My
+history" và "Disconnect"), gọi đúng popup này.
+
+Dữ liệu lấy từ 2 bảng D1 mới (`referrals`, `referral_earnings`, xem `functions/schema.sql`),
+đổ bởi `automation/src/indexHistory.ts` (đã mở rộng bắt thêm event `ReferrerSet`,
+`ReferralPaid`, `ReferralAccrued`, `Swept`). Điểm khó: contract **không lưu ai tạo ra khoản
+referral nào** — `ReferralPaid(referrer, amount)` không có tham số winner. Ghép bằng thứ tự
+event: `_settle()` luôn emit `ReferralPaid`/`ReferralAccrued` NGAY TRƯỚC `Claimed`/`Swept`
+của đúng người thắng đó, trong cùng 1 tx — nên indexer giữ 1 "pending earning" theo tx hash,
+gán `referred = winner` khi gặp `Claimed`/`Swept` kế tiếp cùng tx. Cũng tiện tay fix luôn 1
+lỗ hổng cũ: `Swept` (thắng qua `sweep()`) trước đây KHÔNG được ghi vào lịch sử "Won" như
+`Claimed` — giờ ghi như nhau.
+
+API mới: `functions/api/referrals.js` (`GET /api/referrals?wallet=0x...`). Hook mới:
+`useReferralSummary.ts`, cùng pattern `useMyHistory.ts`.
+
+### 2. Logo bị lỗi — dark-variant làm trắng luôn cả nét đen trong mark
+
+Từ phiên deploy lại (mục dưới) tôi lấy 3 file mới trên Desktop (`logo.svg`, `fulllogo.svg`,
+`privy.svg`) rồi sinh bản "dark" (chữ trắng cho nền tối) bằng cách thay TOÀN BỘ
+`fill="black"` → `#FFFFFF`. **Sai**: file `fulllogo.svg`/`privy.svg` có 10 path fill=black,
+trong đó chỉ 8 path là chữ "LuckyPot" (nên đổi trắng), còn 2 path là **nét vẽ bên trong mark**
+(viền hũ + ký hiệu $) — 2 path này PHẢI giữ đen ở cả 2 bản, chỉ có nền xanh lá + hũ vàng đổi
+theo mark, không phải chữ. User bắt lỗi bằng mắt, so với `luckypot.cc/app` làm chuẩn.
+
+Fix: phân biệt bằng toạ độ x của điểm `M` đầu tiên trong `d` — path nào có x nằm ngoài bbox
+của mark (>260 với fulllogo cỡ 944×279, >52 với privy cỡ 200×100) mới là chữ, mới đổi màu.
+Áp dụng lại cho cả `src/assets/logo-full-dark.svg`, `landing/logo-full-dark.svg`, và render
+lại `landing/privy-logo-dark.png` bằng Chrome headless (xem "CHỤP MÀN HÌNH ĐƯỢC RỒI" bên
+dưới để biết cách rasterize SVG→PNG không cần thư viện). Vì admin page dùng chung
+`Navbar.tsx` với app nên sửa 1 file `src/assets/logo-full-dark.svg` là app + admin tự khớp.
+
+Nhân tiện cũng giảm size logo navbar 1/4 theo yêu cầu: `--row-h` lockup 38px → 28.5px
+(`.brand__lockup` trong `global.css`, và bản HTML tương ứng trong `landing/index.html`).
+
+### 3. Admin page layout xấu — do không dùng chung `.app-shell`
+
+`AdminPage.tsx` trước đó tự chế `<div style={{maxWidth:480, background:page-bg}}>` thay vì
+dùng class `.app-shell` chung (đúng breakpoint 430/860px + màu `--color-surface`) mà
+Dashboard đang dùng — nên nhìn lệch hẳn so với 2 trang kia dù chạy chung 1 React app. Đổi
+sang `.app-shell` + navbar `position: sticky` giống hệt Dashboard, tiêu đề "Admin" dùng
+`font-display` khớp typography chung. Đã verify bằng screenshot cả 2 breakpoint.
+
+### 4. `forceEndEpoch` báo lỗi dù đã có `KEEPER_ROLE` — thiếu bước commit
+
+`forceEndEpoch()` yêu cầu `e.committed == true` (`require(e.committed, "commit first")`) —
+epoch #1 của contract mới **chưa từng được `commitRandom()`** (bot tự động chưa kịp/chưa
+chạy), nên bấm Force end epoch luôn revert dù ví admin đã tự cấp `KEEPER_ROLE` cho mình.
+Admin page trước đó không có cách tự commit. Thêm 2 ActionCard mới:
+
+- **Commit random** — sinh số bí mật bằng `crypto.getRandomValues` ngay trên trình duyệt,
+  gọi `commitRandom(keccak256(secret))`, lưu secret vào `localStorage` (khoá theo địa chỉ
+  pool + epoch id, xem `lib/commitSecret.ts`). **Mất secret (xoá dữ liệu trình duyệt) = epoch
+  đó kẹt vĩnh viễn**, không có đường thoát nào khác — y hệt rủi ro bot gặp với cache GitHub
+  Actions, chỉ là giờ bản sao đó nằm ở trình duyệt admin.
+- **Reveal & draw** — đọc lại secret đã lưu, gọi `revealAndDraw(secret)`.
+
+Quy trình đúng trên admin page giờ là: **Commit random → Force end epoch (nếu chưa hết giờ)
+→ Reveal & draw**. Cả `forceEndEpoch` lẫn `forceSweepReady` đều cần `KEEPER_ROLE`, KHÔNG
+phải `DEFAULT_ADMIN_ROLE` — đã ghi rõ trong mô tả từng ActionCard để khỏi nhầm lần sau.
+
+⚠️ **User hỏi "epoch 0 người tham gia vẫn phải reveal hả" — CÓ, bắt buộc.**
+`currentEpochId` chỉ tăng lên bên trong `revealAndDraw()`, contract không có đường nào khác
+để đóng epoch. Với epoch rỗng, reveal vẫn chạy nhưng vô hại: `eligibleCount=0` →
+`numWinners=0`, không cần `fundYield` trước (điều kiện `funded >= weeklyPrizePool` tự đúng
+vì cả 2 vế đều 0), không ai trúng, không tiền di chuyển — chỉ tốn gas cho 1 vòng ngẫu nhiên
+không dùng tới. **Không phải bug**, nhưng KHÔNG có hàm "skip epoch rỗng" rẻ hơn — nếu muốn có
+thì đó là thay đổi logic contract thật (cần deploy lại theo đúng nguyên tắc user đã chốt),
+chưa làm.
+
+⚠️ User cũng nghi ngờ 1 chỗ khác là bug: "cào số" cho user **KHÔNG** liên quan tới việc admin
+bấm Reveal & draw — cào thẻ ở Dashboard chỉ hiện cho ai có `myPoolBalance > 0`
+(`Dashboard.tsx`), epoch 0 người tham gia thì không ai thấy cào thẻ cả. Đã giải thích rõ,
+KHÔNG phải sửa code — nhưng lưu ý đây vẫn là 1 gate chưa hoàn toàn chính xác về lý thuyết
+(dùng tổng `balances()` chứ không phải "có eligible ở đúng epoch vừa quay hay không" — 1 ví
+vừa gửi tiền pending giữa epoch có thể vẫn bị nhắc cào 1 epoch mà mình chưa từng có vé), chỉ
+là chưa có bằng chứng nó đã xảy ra thật; muốn sửa triệt để cần lưu thêm block/epoch lúc quay
+vào D1 để so lịch sử — chưa làm, ghi lại đây để nhớ nếu sau này có report thật.
+
+### 5. Banner faucet/bán USDC-EURC-cirBTC — sửa 3 lần trong phiên, chốt lại luật đa số
+
+Thứ tự các lần sửa (để hiểu vì sao code trông "chưa ổn định"):
+1. Off-by-one `usdcBal > 20_000_000n` → `>=` (ví đúng 20 USDC bị tính nhầm là "chưa từng
+   faucet").
+2. Đổi hẳn điều kiện: **cả 3 đồng đều phải vượt ngưỡng riêng** (USDC>10, EURC>10,
+   cirBTC>ngưỡng) thay vì `eurcBal>0 || cirbtcBal>0`.
+3. **Sai theo hướng ngược lại**: bắt CẢ 3 (AND) hoá ra quá khắt khe — ví thật có 41 USDC/40
+   EURC/0.0001 cirBTC (2/3 đã dư dả) vẫn không hiện nút bán vì cirBTC chưa qua ngưỡng
+   `0.00025` (đoán sai từ đầu). User chốt lại đúng luật: **đa số 2/3**, không phải cả 3 —
+   `tokensOverThreshold >= 2`. Ngưỡng cirBTC sửa lại `0.00005` (8 decimals, `5_000n`), không
+   phải `0.00025`.
+
+Ngưỡng cuối cùng: USDC>10 / EURC>10 / cirBTC>0.00005 (mỗi loại 6/6/8 decimals), cần **ít
+nhất 2 trong 3** đồng vượt mốc mới hiện "sell", còn lại hiện "faucet".
+
+### 6. Nút X đóng popup khó bấm
+
+`Modal.tsx` — nút X chỉ to bằng icon (`padding: 0`), khó trúng trên di động. Thêm
+`padding: 10px; margin: -10px` (mở rộng vùng chạm, giữ nguyên vị trí icon vì margin âm triệt
+tiêu padding). Áp dụng cho toàn bộ popup vì tất cả đều dùng chung `Modal.tsx`.
+
+### Hiện trạng on-chain sau phiên này
+
+| | |
+|---|---|
+| Contract (proxy) | `0xBdE568986a009eBaAE31Cb78033470c334Fad698` — KHÔNG đổi trong phiên này |
+| Epoch hiện tại | #1, `committed=false`, `drawn=false`, 0/0 eligible |
+| Ví admin `0xb0ea48A1...A12E` | có cả `DEFAULT_ADMIN_ROLE` **và** `KEEPER_ROLE` (tự cấp keeper qua trang admin trong phiên này) |
+| Ví keeper bot `0x4672A3B3...` | 80 USDC, 0 EURC, 0 cirBTC |
+| Ví admin (để test faucet/sell banner) | ~41 USDC, ~40 EURC, ~0.0001 cirBTC |
+
+---
+
+## Trạng thái nghỉ 2026-08-31 — Deploy lại từ đầu (contract mới, `executeExternalCall` + whitelist), pool sạch
+
+Pool cũ đã rút sạch về 0 hôm trước (`forceWithdrawAll`). User quyết định: **thay vì vá thêm
+lần nữa lên proxy cũ**, deploy hẳn 1 proxy MỚI với logic "toàn vẹn" — gộp sạch những gì trước
+đây phải làm 2 bước (`initialize` + `initializeV2`) thành 1, và đưa luôn năng lực mới
+(`executeExternalCall`) vào ngay từ đầu thay vì tính là 1 bản vá riêng.
+
+### 1. Vì sao KHÔNG dùng Vitael — quyết định trước khi deploy lại
+
+Sau khi tìm ra đúng pool USDC thật của Vitael (`0x1D1d19F958cDB6FA2e6C7E5DC16F0a39fe066c9f`,
+2 lần đoán sai trước đó — xem mục "Kế hoạch dùng lending thật của Vitael" bên dưới để full
+context điều tra), user chốt: **KHÔNG tích hợp Vitael lúc này** — 2 lý do:
+1. Dự án Vitael còn testnet, rủi ro cao, chưa đủ tin cậy để phụ thuộc vào.
+2. Lãi thật quá thấp (~1-2%) không đủ hấp dẫn để làm nổi bật ưu điểm của pool.
+
+→ Thay vì tích hợp 1 protocol cụ thể, user muốn có sẵn **công cụ quản lý chung** để tự làm
+việc này bất cứ khi nào (`executeExternalCall`), không phụ thuộc Vitael hay bất kỳ ai.
+
+### 2. `executeExternalCall` — thiết kế qua nhiều vòng phản biện thật, không phải chốt 1 lần
+
+User ban đầu tưởng đây là ví admin tự gửi tiền cá nhân — SAI, đây là **công cụ quản lý
+protocol**: cho phép admin chuyển `balancesTotal` (tiền user đã gửi) sang bất kỳ contract nào
+để tạo yield, rồi rút về. Sau khi tôi phản biện kỹ 4 rủi ro cụ thể (Vitael tự nâng cấp contract
+sau khi đã whitelist — đã xảy ra thật với chính Vitael trong lúc điều tra; 1 chữ ký sai mất
+sạch chứ không mất 1 phần; không giới hạn số lượng chuyển mỗi lần; mỗi lần dùng phải pause),
+user tự chốt thêm 2 lớp chắn:
+
+- **Whitelist + trễ hiệu lực 3 ngày khi THÊM target mới** (`proposeAllowedTarget` →
+  `TARGET_TIMELOCK = 3 days` → `isTargetAllowed()`). Gỡ (`revokeAllowedTarget`) thì **ngay lập
+  tức**, không trễ — không có lý do gì phải trì hoãn việc tắt bớt quyền.
+- **1 pool không được giữ quá 50% tổng tiền đã triển khai ra ngoài** (`MAX_SINGLE_TARGET_BPS
+  = 5000`) — ép chia ra ít nhất 2 pool, đúng nguyên tắc user luôn theo ("tôi luôn nói cho tiền
+  vào ít nhất 2 pool cho an toàn"). Miễn trừ cho lần gửi đầu tiên (chưa có pool thứ 2 để so).
+
+Cơ chế đo: **so sánh số dư USDC thật của chính contract trước/sau mỗi lệnh gọi**
+(`poolToken.balanceOf(address(this))`), không tin số admin nhập tay — vừa đúng khi gửi tiền
+ra, vừa đúng khi rút về (kể cả rút về nhiều hơn gốc vì có lãi, phần dư clamp về 0 thay vì
+underflow).
+
+```solidity
+function executeExternalCall(address target, uint256 approveAmount, bytes calldata data)
+    external onlyRole(DEFAULT_ADMIN_ROLE) whenPaused nonReentrant returns (bytes memory)
+```
+
+`whenPaused` bắt buộc (như `withdrawReserve`) — không bao giờ chuyển tiền âm thầm lúc pool
+trông bình thường.
+
+### 3. `forceSweepReady` — mirror của `forceEndEpoch` nhưng cho cửa sổ sweep
+
+User muốn test luồng "không ai claim → sweep() quét tiền về" ngay trong buổi, không đợi 3 ngày
+thật. `sweep()` không có cách tua nhanh thời gian trên testnet thật (khác `forceEndEpoch` chỉ
+cần đổi 1 biến nội bộ), nên thêm hàm testnet-only mirror đúng pattern `forceEndEpoch`:
+
+```solidity
+function forceSweepReady(uint256 epochId) external onlyRole(KEEPER_ROLE) {
+    Epoch storage e = epochs[epochId];
+    require(e.drawn, "not drawn");
+    e.drawnAt = uint64(block.timestamp - SWEEP_DELAY);
+}
+```
+
+Lùi `drawnAt` về đúng lúc để `sweep()` mở ngay — đồng thời đóng luôn `claim()` cùng lúc, đúng
+bản chất (2 cửa sổ là 2 mặt của cùng 1 ranh giới, không phải side-effect cần né).
+
+⚠️ Cả `forceEndEpoch` LẪN `forceSweepReady` đều ghi rõ trong code: **PHẢI `revokeRole` trước
+khi pool có tiền thật** — 2 hàm này cho phép keeper né hoàn toàn thời gian chờ thật.
+
+### 4. Gộp `initialize` + `initializeV2` thành 1 hàm
+
+Bản gốc phải tách `initializeV2()` (`reinitializer(2)`) vì lúc thêm state kỹ thuật-spec thì
+proxy ĐÃ có tiền thật, không đổi thẳng chữ ký `initialize()` được. Giờ deploy mới hoàn toàn
+nên gộp lại — 1 hàm `initialize(token, admin, keeper, aprUSDC, aprARC, usdcAddress)` set hết
+trong 1 lần, đúng tinh thần "toàn vẹn logic" user yêu cầu. `initializeV2` đã xoá khỏi contract.
+
+### 5. Test: 22/22 pass, có mock contract mới `MockExternalPool.sol`
+
+Thêm `contracts/mocks/MockExternalPool.sol` (giả lập 1 lending pool ngoài: `supply()`,
+`withdraw()`, `withdrawWithBonus()` để test case "rút về nhiều hơn gốc vì có lãi"). 5 test mới:
+whitelist+trễ hiệu lực, giới hạn 50%/pool (kèm case miễn trừ lần đầu), rút về đúng bằng delta
+số dư thật (clamp), và `forceSweepReady`.
+
+⚠️ **Gotcha lúc viết:** "Stack too deep" khi compile `executeExternalCall` (quá nhiều biến cục
+bộ trong 1 hàm) — fix bằng tách phần tính accounting ra hàm `_updateExternalDeployment` riêng,
+KHÔNG bật `viaIR: true` (tránh đổi cả pipeline compile của project chỉ vì 1 hàm).
+
+### 6. Deploy lại từ đầu — quy trình + mọi chỗ đã cập nhật địa chỉ mới
+
+```bash
+cd contracts && npx hardhat ignition deploy ignition/modules/LuckyStakerPool.ts \
+  --network arcTestnet --parameters <file: adminAddress, keeperAddress>
+```
+
+Dry-run trên mạng ảo local trước (không tốn gas, bắt lỗi module trước khi lên thật) — thành
+công thì mới chạy thật. **Gotcha:** deployment-id mặc định trùng `chain-5042002` với lần deploy
+GỐC của dự án (từ thời tên contract còn lỗi chính tả "LuckyStackerPool") — output lệnh in ra
+CẢ 2 bộ địa chỉ cũ lẫn mới lẫn lộn, phải tự phân biệt bằng thời gian/tên module đúng chính tả.
+
+**Verify on-chain sau deploy (không tin CLI output):** `currentEpochId=1`, `paused=false`,
+`aprBpsUSDC=600`, admin/keeper role đúng, `balancesTotal=0`, `epoch1.endTime` = +7 ngày từ lúc
+deploy (chưa Monday-align, tự sửa ở lần quay đầu tiên — hành vi cũ, có test).
+
+**Mọi chỗ đã cập nhật sang proxy mới `0xBdE568986a009eBaAE31Cb78033470c334Fad698`:**
+- `frontend/.env` (`VITE_POOL_ADDRESS`), `automation/.env` (`POOL_ADDRESS`)
+- GitHub secret `POOL_ADDRESS` (dùng `gh secret set`, verify bằng `gh secret list` thấy
+  timestamp mới)
+- `frontend/landing/index.html` — 2 chỗ hardcode (link ArcScan + `const POOL = "..."` trong
+  script đọc dữ liệu live)
+- `automation/src/indexHistory.ts` → `POOL_DEPLOY_BLOCK = 59_715_964n` (lần này lấy thẳng từ
+  journal deploy, KHÔNG cần binary-search `eth_getCode` như proxy cũ)
+- **D1 `luckypot-history`: xoá sạch bảng `history` (49 dòng cũ) + `sync_state`** — dữ liệu cũ
+  thuộc proxy cũ, vô nghĩa với proxy mới, để lại sẽ làm sai `sync_state.last_block` (indexer
+  tưởng đã quét qua block đó rồi, bỏ sót toàn bộ lịch sử mới)
+- Xoá `automation/state/*.json` (secret commit-reveal cũ, thuộc epoch của proxy cũ)
+- `README.md`, `PROJECT.md` — cập nhật địa chỉ
+
+**Frontend đã deploy + verify bằng screenshot:** Epoch #01, TOTAL POOL 0/0, "No draws yet." —
+đúng trạng thái sạch.
+
+### 7. VIỆC CÒN LẠI — kế hoạch relaunch của user, CHƯA làm hết
+
+User mô tả cả chuỗi: (1) user tự deposit tiền thật từ các ví phụ, (2) Claude kích hoạt cho
+epoch 1 qua (deposit thành eligible), (3) kích hoạt epoch 2 quay số, (4) user CỐ Ý không cho
+ví nào claim, (5) kích hoạt `forceSweepReady` + `sweep()` xem có hoạt động đúng không, (6) sau
+đó để epoch chạy bình thường từ đó.
+
+**Đã xong: bước 0 (deploy sạch).** Từ bước (1) trở đi CẦN USER TỰ DEPOSIT trước (Claude không
+giữ tiền/ví user) — khi quay lại, hỏi user đã deposit chưa rồi mới tiếp tục kích hoạt
+`forceEndEpoch`/`fundYield`/`revealAndDraw`/`forceSweepReady` theo đúng thứ tự trên.
+
+⚠️ **Lỗ hổng thiết kế CŨ, chưa có giải pháp sạch:** cả `forceEndEpoch` lẫn `forceSweepReady`
+đều ghi "phải khoá lại trước khi có tiền thật" nhưng cả 2 dùng chung `KEEPER_ROLE` với
+`commitRandom`/`revealAndDraw`/`fundYield` — **không thể revoke riêng 2 hàm test-only mà giữ
+nguyên tự động hoá bình thường**, vì role áp dụng cho cả nhóm hàm chứ không tách theo từng
+hàm. Đây là khoảng trống có sẵn từ trước (không phải do lần deploy này tạo ra) — nếu sau này
+thật sự cần khoá, phải tách `KEEPER_ROLE` thành 2 role riêng (1 cho vận hành thật, 1 cho tiện
+ích testnet), là việc CHƯA làm.
+
+---
+
+## Trạng thái nghỉ 2026-08-30 (khuya, phiên mới) — contract V5 (`forceWithdrawAll`), kế hoạch Vitael
+
+### 0. Trang Admin console `/app/admin` (MỚI, đã deploy — thay hẳn cách làm HTML rời rạc)
+
+User chán cảnh mỗi lần cần ký giao dịch admin là Claude phải dựng 1 file HTML rời + local
+server riêng (như `upgrade-v5.html` ở mục dưới) — kêu làm 1 trang điều phối dùng lại được.
+Đã thêm `frontend/src/pages/AdminPage.tsx`, route `/app/admin` (App.tsx tự check
+`window.location.pathname`, KHÔNG cài react-router — app vốn triết lý "no other pages").
+
+Vào trang tự check `hasRole(DEFAULT_ADMIN_ROLE, address)`, nếu đúng ví admin mới hiện các
+nút: **Pause/Unpause, Force withdraw all, Upgrade (dán địa chỉ implementation mới, tự gọi
+`upgradeToAndCall(addr, 0x)`), setAprBpsUSDC/ARC, Approve+Fund yield.** Mỗi nút qua 1
+`TxButton` chung, tự hiện trạng thái pending/confirm/lỗi + link ArcScan. Từ giờ về sau
+KHÔNG cần dựng file HTML riêng cho từng thao tác admin nữa — vào thẳng `luckypot.cc/app/admin`.
+
+⚠️ **Gotcha tốn ~5 lượt deploy mới ra: `_redirects` rewrite (kể cả đúng cú pháp
+`/app/*  /app/index.html  200` theo docs Cloudflare) LUÔN thua fallback riêng của Cloudflare
+Pages cho path chưa khớp** — Pages tự trả về **ROOT `/index.html` (landing page)** cho MỌI
+path lạ, kể cả đường dẫn hoàn toàn ngẫu nhiên (`/foo123`), **kể cả trên domain `*.pages.dev`
+gốc** (không phải do custom domain `luckypot.cc`, không phải do zone-level rule). `_redirects`
+KHÔNG thắng được hành vi này dù đúng cú pháp. **Fix thật: bỏ hẳn `_redirects`, cho
+`build-site.mjs` copy file tĩnh thật** `dist-site/app/admin/index.html` (bản sao
+`app/index.html` sau khi vite build xong) — file tĩnh có thật thì Cloudflare serve bình
+thường, không dính fallback vì không cần rewrite gì cả. Script/asset tag trong
+`app/index.html` là absolute path (`base: "/app/"`) nên copy sâu thêm 1 cấp vẫn load đúng
+bundle. **Nhớ bài học này** nếu sau này cần thêm route tĩnh nào khác trong `/app/*`.
+
+### 1. Cào cào to gấp đôi (đã xong, đã deploy)
+
+`ScratchCanvas.tsx` — bán kính cọ cào từ 28px lên **56px** (x2), user kêu cào mỏi tay. Đổi 1
+dòng, không đụng ngưỡng `0.45` (45% diện tích lộ ra mới coi là "revealed").
+
+### 2. Kế hoạch dùng lending thật của Vitael (đang bàn, CHƯA code)
+
+User muốn thay yield giả lập (keeper tự bỏ tiền bù `fundYield()` theo `aprBpsUSDC` admin-set,
+hiện = 600bps = 6%, band cho phép 400-800) bằng yield thật từ **Vitael** (`vitael.xyz`) — lending
+protocol thật của **em trai user**, cũng chạy trên **Arc Testnet, cùng chain 5042002**, hỗ trợ
+USDC/EURC/cirBTC, oracle Stork. Đã đọc docs Vitael (site dạng Next.js, các mục con như
+"Interest Rates" là `<button>` đổi state JS chứ KHÔNG có URL riêng — muốn đọc phải click thật,
+không dump-dom được).
+
+User báo APY thật của Vitael chỉ **1,88%** (thấp vì testnet gần như không ai vay, mà lãi gửi
+kiểu Aave luôn tỉ lệ theo utilization), muốn kéo lên **~5%**. Đã thống nhất **2 hướng làm song
+song**:
+1. **Kỹ thuật:** giữ nguyên cơ chế admin-set APR của LuckyPot (5% vẫn nằm gọn trong band
+   400-800bps, không cần sửa contract phần đó) nhưng cho **keeper thật sự gửi USDC nhàn rỗi
+   của pool vào Vitael** để có real yield cộng thêm, thay vì 100% là keeper tự bỏ tiền túi bù.
+2. **Kinh doanh (với em user):** Vitael thêm 1 chương trình thưởng/liquidity-mining riêng cho
+   pool USDC để kéo APY hiệu dụng lên ~5% — không phải sửa lãi suất thị trường, mà cộng thưởng
+   lên trên, đồng thời kéo người dùng thật vào test Vitael.
+
+**Đã đào được kiến trúc Vitael thật (chưa xong, đang dở giữa chừng vì chuyển sang làm
+`/app/admin` — xem mục 0):**
+
+- KHÔNG lấy được địa chỉ từ docs (site Next.js, các mục con là `<button>` đổi state JS, không
+  có URL riêng, không dump-dom được — muốn đọc phải click thật qua Playwright/CDP thật sự).
+- Tải hết ~45 JS chunk của `vitael.xyz/lend` (`grep -ohE "0x[a-fA-F0-9]{40}"`) ra rất nhiều
+  địa chỉ nhưng lẫn lộn (predeploy OP-stack `0x4200...`, Multicall3, placeholder ETH...) —
+  không đáng tin, dừng hướng này.
+- **Cách ăn chắc: search trực tiếp trên `testnet.arcscan.app` API**
+  (`/api/v2/search?q=...`) theo tên — ra kết quả xác đáng:
+  - `Vitael Interest Bearing USDC` (symbol `vUSDC`) tại `0x2950c3209F6329143A9cba1486479628109277a1`
+    — token đại diện phần đã supply, giống aToken của Aave.
+  - Nhiều `Vitael LP` token khác nhau — thuộc tính năng Swap/Liquidity Pool, KHÔNG phải lending.
+  - **Kiến trúc lending KHÔNG phải 1 pool tổng kiểu Aave** — search `"LendingPool"` ra
+    `LendingPoolFactory` (`0x54f6Ff27093FC45c5A39083C3Ef0260D25012Be3`, đã verify ABI) +
+    `LendingPoolAddressesProvider` (`0xC48674acd3CafDd5746A94B5144eA57672592bF3`) +
+    **30+ instance `LendingPool` riêng lẻ**, mỗi cái là **1 CẶP** `(collateralToken,
+    borrowToken)` độc lập với đường cong lãi suất riêng (`ltv`, `baseRate`, `rateAtOptimal`,
+    `optimalUtilization`, `maxUtilization`, `maxRate`, `liquidationThreshold`,
+    `liquidationBonus` — struct `LendingPoolFactoryHook.LendingPoolParams`). Giống mô hình
+    Morpho Blue / Fraxlend (isolated pair pools), KHÔNG giống Aave V3 (1 pool nhiều reserve).
+  - Factory **KHÔNG có hàm `getPool(asset)` để tra cứu trực tiếp** — phải enumerate qua event
+    `LendingPoolCreated(tuple lendingPoolParams, address router, address routerImplementation,
+    address lendingPool, address lendingPoolImplementation, address sharesToken)` bằng
+    `getLogs` trên factory, lọc theo `lendingPoolParams.borrowToken == USDC` (hoặc
+    `collateralToken`) để tìm đúng (các) pool có USDC.
+
+**✅ ĐÃ TÌM RA pool USDC THẬT + interface, đã tự sửa lại 1 lần vì đoán sai ban đầu
+(2026-08-31).**
+
+Lượt đầu: search tên `"LendingPool"` trên ArcScan ra ~30 địa chỉ, gọi `asset()` từng cái lọc
+theo token — ra 2 pool USDC (`0x50A452cD...` TVL 553 USDC, `0x1CA2e7B0...` TVL 41 USDC).
+User đưa số liệu thật trên UI Vitael (APY 1.88%/4.38%, util 47.6%, **TVL $28.3K**) — **không
+khớp cả 2 pool đó** (TVL sai lệch quá xa, x50-700 lần). → 2 pool đó là kiến trúc **isolated
+pool CŨ, do factory cũ (`0x54f6Ff27...`, chỉ có đúng 4 giao dịch, tất cả từ 2026-02-07 — đã
+ngừng dùng từ lâu)**.
+
+**Cách tìm ra pool đúng: đọc `LendingPoolAddressesProvider` (`0xC48674acd3CafDd5746A94B5144
+eA57672592bF3`) — đây mới là registry hiện hành, gọi `getLendingPool()` trả về ĐÚNG pool
+đang sống:**
+
+- **Pool USDC/EURC chính thức: `0x1D1d19F958cDB6FA2e6C7E5DC16F0a39fe066c9f`** (verified) —
+  kiến trúc Aave V3 THẬT (1 pool, nhiều reserve), không phải isolated-pair như bản cũ.
+  `getReservesList()` trả về đúng **[USDC, EURC]** — khớp y hệt token LuckyPot đã biết. cirBTC
+  CHƯA có trong danh sách reserve (chưa list trên pool này, hoặc quản lý riêng — chưa rõ).
+- **Interface thật (ABI verified, đúng chuẩn Aave V3, không đoán):**
+  ```solidity
+  function supply(address asset, uint256 amount, address onBehalfOf) external;
+  function withdraw(address asset, uint256 amount, address to) external;
+  function borrow(address asset, uint256 amount, address onBehalfOf) external;   // không cần cho LuckyPot
+  function repay(address asset, uint256 amount, address onBehalfOf) external returns (uint256);
+  function getReserveData(address asset) external view returns (ReserveData);
+  function getReservesList() external view returns (address[]);
+  function getUserAccountData(address user) external view returns (tuple);
+  ```
+  `getReserveData(USDC)` lúc đọc trả `totalLiquidity≈302 USDC`, `totalBorrowed≈54 USDC`
+  (util ~18%) — KHÔNG khớp hẳn con số $28.3K/47.6% user đọc trên UI cùng lúc, nhiều khả năng
+  do dữ liệu testnet đổi liên tục (người khác đang test), không phải sai địa chỉ nữa — địa
+  chỉ này lấy từ chính registry hiện hành, không phải đoán theo TVL như lượt đầu.
+- **Bài học:** đừng đoán "pool nào TVL to hơn thì đúng" giữa nhiều pool tên giống nhau — luôn
+  tìm registry/factory HIỆN HÀNH trước (`getLendingPool()`/`getPool()` kiểu Aave luôn có 1
+  điểm entry chính thức), rồi mới tin theo địa chỉ nó trả về.
+
+**Việc còn dở, làm tiếp khi quay lại:**
+1. Xác nhận lại 1 lần nữa với em user (giờ đã có địa chỉn nguồn từ registry, độ tin cậy cao
+   hơn nhiều so với đoán TVL — nhưng cirBTC thiếu trong reserve list nên vẫn đáng hỏi).
+2. Thiết kế `depositToVitael`/`withdrawFromVitael` — CHƯA CHỐT nên đặt trên `LuckyStakerPool`
+   (đụng contract đang giữ tiền thật) hay tách keeper tự giữ riêng 1 khoản gửi Vitael độc lập.
+   **User đã chọn: sửa thẳng `LuckyStakerPool`** (đúng bản chất hơn — tiền user thật sự sinh
+   lãi — nhưng rủi ro cao hơn nhiều, contract đang giữ tiền thật, cần cẩn trọng khi code +
+   test kỹ trên pool đang trống/paused trước khi unpause).
+
+### 3. Contract upgrade V5 — thêm `forceWithdrawAll()` (ĐÃ LÊN CHAIN THẬT)
+
+Trước khi đụng vào tiền thật của pool để tích hợp Vitael, cần rút sạch pool ra để test an toàn
+trên pool trống. User hỏi "có hàm nào đẩy hết tiền user về ví họ không" — chưa có, chỉ có
+`withdraw()` tự rút. Đã thêm:
+
+```solidity
+function forceWithdrawAll() external onlyRole(DEFAULT_ADMIN_ROLE) whenPaused nonReentrant
+```
+
+— loop `participants`, trả **đúng số dư của từng người về đúng ví người đó** (không thể chuyển
+đi đâu khác, không có tham số địa chỉ đích), bắt buộc `whenPaused` trước (như `withdrawReserve`)
+để không chạy âm thầm. Test mới: "lets the admin force-withdraw everyone's principal to their
+own wallet while paused" — 17/17 test pass.
+
+**Quy trình upgrade (giống hệt V2/V3/V4trước giờ):**
+1. Deploy implementation MỚI, không đụng proxy (an toàn, ký bằng `DEPLOYER_PRIVATE_KEY`):
+   ```bash
+   cd contracts && npx hardhat ignition deploy ignition/modules/LuckyStakerPoolV5Implementation.ts --network arcTestnet --deployment-id luckypot-v5-impl
+   ```
+   → deployed tại `0x39bDCbB8228440D529Df6a7aADa86A60ddF8Dc6a`.
+2. Admin (`0xb0ea48A1979326BA9e0b5027D105C8DF9CCAA12E`) tự ký `upgradeToAndCall(0x39bD...,
+   0x)` — Claude không giữ private key admin, không tự ký được. Làm 1 trang HTML nhỏ
+   (`~/Desktop/upgrade-v5.html`, serve qua `python -m http.server` ở `127.0.0.1:8532` vì
+   MetaMask không tự inject vào trang mở kiểu `file://`) cho user tự Connect Wallet + bấm gửi.
+3. **User đã ký xong — verify bằng `eth_getStorageAt` slot EIP-1967
+   (`0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bb`) trên proxy, ra đúng
+   `0x39bdcbb8228440d529df6a7aada86a60ddf8dc6a`.** Upgrade thành công thật, không phải suy đoán.
+
+⚠️ **Gotcha lúc ký: ví báo sai mạng dù user nói "đang trỏ Arc Testnet".** `eth_chainId` trả về
+thật là `0x2105` = **8453 = Base mainnet**, không phải Arc Testnet (`5042002` = `0x4cef52`).
+Khả năng máy cài nhiều ví (VD MetaMask + Coinbase Wallet) và `window.ethereum` bị ví khác
+(Coinbase Wallet mặc định Base) giành quyền inject thay vì ví user tưởng đang active. Đã sửa
+trang tự gọi `wallet_switchEthereumChain` (fallback `wallet_addEthereumChain` nếu ví chưa có
+sẵn Arc Testnet) thay vì chỉ báo lỗi suông.
+
+**✅ ĐÃ XONG (verify on-chain sau khi user bấm 2 nút 3-4 trên `upgrade-v5.html`):**
+`paused() == true`, `balancesTotal() == 0` — pool sạch hoàn toàn, an toàn để build/test tích
+hợp Vitael mà không đụng tiền thật của ai.
+
+⚠️ **Hệ quả đã xảy ra thật (2026-08-31, ~3h sáng UTC): GitHub báo `keeper.yml` fail.** KHÔNG
+phải bug — epoch #8 hết giờ đúng lịch (`endTime` Thứ Hai 00:00 UTC), keeper tự động thử
+`revealAndDraw` như bình thường nhưng revert `EnforcedPause()` vì pool vẫn đang pause từ hôm
+qua. **User đã xác nhận CHỦ Ý giữ pause thêm** (chưa sẵn sàng mở lại) — chấp nhận đánh đổi:
+job "Commit or reveal the weekly draw" trong `keeper.yml` sẽ **tiếp tục báo fail đều đặn mỗi
+6 tiếng** cho tới khi có ai gọi `unpause()` (qua `/app/admin`, mục 0). Đây là fail *mong đợi*,
+đừng tưởng nhầm là lỗi code keeper hay lỗi contract — chỉ cần nhớ khi quay lại: **epoch #8
+đang bị kẹt (đã commit, chưa quay được), sẽ tự quay ở lần keeper chạy kế tiếp sau khi
+unpause**, không cần can thiệp gì thêm ngoài việc unpause đúng lúc.
+
+⚠️ `~/Desktop/upgrade-v5.html` + local server `python -m http.server` ở `127.0.0.1:8532` đã
+**dừng, không còn chạy** — mọi thao tác admin sau này (kể cả upgrade contract) làm qua
+`/app/admin` (mục 0 ở trên) thay vì dựng lại file HTML rời.
+
+---
+
+## Trạng thái nghỉ 2026-08-30 (gần sáng) — My history chuyển sang D1, không quét RPC nữa
+
+Sau khi ship xong bản quét-RPC-trực-tiếp (mục ngay bên dưới), user hỏi thẳng: "có cần
+database không, chẳng lẽ không có cách nào đơn giản hơn?" — hỏi đúng. Đã làm lại đúng
+kiến trúc: **Cloudflare D1** (`luckypot-history`, database_id `5d8b9b50-3903-4cc7-9dc4-
+d5d8374969c0`, tạo bằng `wrangler d1 create`).
+
+**Luồng dữ liệu mới:**
+1. `automation/src/indexHistory.ts` — script mới, chạy trong `keeper.yml` (GitHub Actions,
+   **đã có sẵn lịch 6 tiếng/lần** cho việc quay số, tận dụng luôn, không tạo job riêng).
+   Mỗi lần chạy chỉ cần quét ~6 tiếng block mới (vài chunk) chứ không phải toàn bộ lịch sử
+   — đây chính là lý do dùng cron thay vì client tự quét: **server-side quét ĐỀU ĐẶN từng
+   chút một, không bao giờ phải quét dồn hàng triệu block trong 1 lần.**
+2. Đọc/ghi D1 qua **Cloudflare REST API** (`POST .../d1/database/{id}/query`), KHÔNG dùng
+   binding trực tiếp — vì GitHub Actions chạy ngoài runtime Cloudflare Workers, không có
+   binding. Cần `CF_ACCOUNT_ID` + `CF_API_TOKEN` (đã test token sẵn có trong
+   `EZwallet/.env.txt` CÓ quyền đọc/ghi D1 — không cần tạo token mới).
+3. `functions/api/history.js` — Function mới, đọc D1 qua **binding** `HISTORY_DB` (khai báo
+   trong `wrangler.toml` ở gốc repo), trả JSON cho frontend theo `?wallet=0x...`.
+4. `useMyHistory.ts` viết lại gọn hẳn — chỉ còn `fetch('/api/history?wallet=...')`, xoá hẳn
+   toàn bộ logic quét/chunk/retry/backoff và `lib/historyCache.ts` (không cần cache
+   localStorage nữa vì D1 đã là nguồn lưu trữ bền, đọc lúc nào cũng nhanh).
+
+⚠️ **`wrangler.toml` ở gốc repo là file MỚI, lần đầu dự án này có config này** — trước giờ
+deploy hoàn toàn zero-config (`wrangler pages deploy frontend/dist-site --project-name=
+luckypot`). File này **BẮT BUỘC phải có đủ 3 field**: `name`, `pages_build_output_dir`,
+và **`compatibility_flags = ["nodejs_compat"]`** — thiếu `nodejs_compat` thì deploy die
+với lỗi khó hiểu `Uncaught Error: No such module "node:stream"` (tốn khá nhiều lượt thử để
+tìm ra, xem "Bài học" bên dưới). Thiếu `name` hoặc `pages_build_output_dir` thì wrangler
+**âm thầm bỏ qua cả file**, không báo lỗi rõ ràng — dễ tưởng binding có tác dụng mà thực
+ra không.
+
+**Backfill lần đầu đã chạy xong** (local, `npm run index-history`, ~1,19 triệu block, dùng
+đúng logic quét 10.000 block/chunk + retry-backoff đã viết cho bản client-side trước đó) —
+37 bản ghi, verify khớp 100% với dữ liệu đã kiểm chứng qua RPC trực tiếp trước đó (ví
+`0xe7d7...93c1`: 119 + 318 + 89 USDC).
+
+✅ **Đã xong (2026-08-30 gần sáng, ngay sau khi viết mục này):** 2 secret
+`CF_ACCOUNT_ID`/`CF_API_TOKEN` đã set thành công lên repo qua `gh secret set` — verify
+bằng `gh secret list --repo KattyFury/LuckyPot` thấy cả 2 cùng `KEEPER_PRIVATE_KEY`/
+`POOL_ADDRESS` cũ. Lần thử đầu tiên bị auto-mode classifier của Claude Code chặn (ghi
+credential vào CI cần xác nhận), lần thử lại thì qua — không phải do đổi tài khoản GitHub,
+`gh auth status` xác nhận **KattyFury đã là active account từ trước khi hỏi**, chưa từng
+đổi tài khoản nào trong lượt này. Bước "Index deposit/withdraw/claim history" trong
+`keeper.yml` giờ sẽ chạy đúng ở lần cron kế tiếp. Lệnh đã chạy (giá trị lấy từ
+`EZwallet/.env.txt`), giữ lại đây để tham khảo nếu cần set lại trên máy khác:
+```bash
+gh secret set CF_ACCOUNT_ID --repo KattyFury/LuckyPot --body "<CF_ACCOUNT_ID>"
+gh secret set CF_API_TOKEN --repo KattyFury/LuckyPot --body "<CF_API_TOKEN>"
+```
+
+### Bài học/gotcha lần này
+
+- **`wrangler.toml` cho Pages thiếu field bắt buộc → bị ÂM THẦM bỏ qua, không lỗi.** Chỉ in
+  1 dòng warning dễ lướt qua ("missing pages_build_output_dir... Ignoring configuration
+  file"). Nếu thấy binding "không có tác dụng gì" mà không có lỗi rõ ràng → nghi ngay chỗ
+  này trước, đừng nghi code Function.
+- **Thiếu `nodejs_compat` → lỗi hoàn toàn không liên quan tới nguyên nhân thật**
+  (`No such module "node:stream"`, không nhắc gì tới D1 hay compatibility flag). Tốn 4-5
+  lượt deploy thử-sai mới ra. Nhớ luôn: **hễ thêm `[[d1_databases]]` (hay binding nào cần
+  Node API) vào `wrangler.toml` cho Pages thì thêm `compatibility_flags = ["nodejs_compat"]`
+  ngay từ đầu**, đừng đợi lỗi.
+- REST API của D1 nhận multi-row `INSERT ... VALUES (?,?,...),(?,?,...)` bình thường — đã
+  test trực tiếp trước khi viết `indexHistory.ts`, không đoán.
+
+---
+
+## Trạng thái nghỉ 2026-08-30 (nửa đêm) — My history quét thật, banner đúng ngưỡng, logo navbar to hơn
+
+3 việc user giao trong 1 lượt, cả 3 đã deploy + verify trong bundle production.
+
+### 1. My history luôn rỗng — do RPC, không do code logic sai
+
+`useMyHistory.ts` cũ gọi `getLogs({ fromBlock: 0n })`. Test thẳng bằng curl vào
+`rpc.testnet.arc.io` phát hiện RPC này **luôn từ chối `fromBlock: 0`** với lỗi
+`"pruned history unavailable"` — không liên quan gì đến hoạt động thật của ví. Vì
+`Dashboard.tsx` destructure `data: historyEntries = []`, lỗi bị nuốt âm thầm → My History
+**luôn hiện "No activity yet." với MỌI ví, bất kể có deposit/withdraw/claim thật hay
+không.** Đây là bug 100% tái hiện, không phải thỉnh thoảng.
+
+Đào sâu thêm phát hiện 2 giới hạn cứng khác của RPC này (xác nhận bằng chính error message
+RPC trả về, không đoán):
+- `eth_getLogs is limited to a 10,000 range` — không thể quét quá 10.000 block/lần gọi.
+- Rate limit khá gắt, dùng chung cho MỌI dApp trên Arc Testnet (đã ghi nhận trước đó ở mục
+  "RPC 429"): ~15 request liên tiếp là bị chặn, phải lùi-chờ.
+
+Pool contract đã sống **~1,18 triệu block** (deploy block `58425277`, tìm bằng cách nhị
+phân `eth_getCode` — xem code có xuất hiện ở block nào, KHÔNG đoán từ ngày tháng) — tức
+cần **~119 lần gọi** để quét hết. User hỏi "có cần database không" → **không cần**, dùng
+`localStorage` (file mới `lib/historyCache.ts`, cùng convention với `scratchState.ts`) lưu
+`{lastBlock, entries[]}` theo từng ví. Test thật (script Node độc lập, xoá sau khi xong)
+xác nhận quét trọn 119 chunk mất **~7 phút** (có lùi-chờ theo cấp số nhân khi bị rate-limit)
+và ra đúng dữ liệu Deposited thật của 2 ví thật trên chain — **đã verify, không phải suy
+đoán**. Nhưng đây CHỈ xảy ra 1 lần duy nhất cho mỗi ví (lần đầu tiên mở app / xoá
+localStorage) — mọi lần sau chỉ quét từ `lastBlock` đã cache tới hiện tại, thường 1 request.
+
+Đã tối ưu thêm: gộp 3 event (Deposited/Withdrawn/Claimed) thành **1 lần gọi `getLogs`/chunk**
+thay vì 3 (dùng `parseEventLogs` của viem lọc theo ABI sau khi có logs thô), và đọc
+`log.blockTimestamp` **thẳng từ response `eth_getLogs`** (Arc RPC trả kèm field này, viem
+tự parse) thay vì gọi `getBlock()` riêng cho mỗi block — bỏ hẳn 1 tầng round-trip so với
+code cũ.
+
+⚠️ **Nếu proxy contract bị deploy lại ở địa chỉ mới, phải cập nhật lại `POOL_DEPLOY_BLOCK`**
+trong `useMyHistory.ts` (hằng số hardcode, không tự tính lại).
+
+### 2. Banner faucet/sell — sai tiêu chí, giờ theo đúng USDC balance
+
+`FaucetOrSellBanner.tsx` cũ chuyển sang "sell" chỉ dựa vào `eurcBal>0 || cirbtcBal>0`,
+**không nhìn USDC balance** — dẫn tới hiện "Click here to sell..." ngay cả khi ví chưa có
+USDC để trả gas (USDC là gas token của Arc), bấm vào là dính lỗi. User chốt luật: **USDC >
+20 mới hiện sell, ≤ 20 thì hiện faucet** (20 khớp đúng comment có sẵn trong code: "Circle's
+testnet faucet caps each request at 20 USDC" — tức ví đã faucet full 1 lần thì mới đủ gas).
+
+Fix: `showSellBanner = hasSomethingToSell && usdcBal > 20_000_000n` — giữ cả 2 điều kiện
+(không chỉ mỗi ngưỡng USDC) để tránh 1 kẽ hở mới: ví có nhiều USDC nhưng KHÔNG còn
+EURC/cirBTC để bán thì vẫn phải hiện faucet, không hiện nút "sell" chết (bấm không làm gì).
+
+### 3. Logo navbar quá nhỏ (26px) — đã hỏi lại trước khi đổi vì đụng luật lưới
+
+User ban đầu xin x4 (→104px). Navbar là **hàng #1 trong hệ lưới 50px/hàng CỐ ĐỊNH** (luật
+đã ghi ở mục "HỆ LƯỚI GIAO DIỆN", dựng lại 2 lần vì làm sai) — 104px cao gấp đôi cả navbar,
+chắc chắn tràn ra đè lên banner bên dưới. Đã hỏi lại, user chọn: **giữ nguyên hàng 50px,
+logo chỉ to vừa đủ trong hàng đó** → chốt **38px** (từ 26px, x1.46), là mức lớn nhất còn
+nằm gọn trong navbar. Sửa 2 chỗ đồng bộ:
+- `global.css` → `.brand__lockup` (app, `Navbar.tsx`)
+- `landing/index.html` → `nav.top .brand img` (landing, vốn đã tự nhận "same look as the
+  app's" và cùng dùng `--row-h`)
+
+Verify bằng screenshot Chrome headless zoom cận cảnh cả 2 navbar sau deploy — logo to rõ
+rệt, không tràn, không đè lên đường kẻ dưới navbar.
+
+⚠️ **Follow-up cùng ngày: 38px vẫn "nhỏ" — vì viewBox có khoảng trống ẩn, không phải vì
+38px chưa đủ to.** User báo lại: "logo hiện tại vẫn nhỏ, chẳng qua mình chừa khoảng trống
+nhiều". Đo bằng Chrome headless render + `PIL.Image.getbbox()` (tìm bounding box pixel
+không-trong-suốt) xác nhận đúng: `logo-full.svg`/`logo-full-dark.svg` có `viewBox="0 0 1024
+512"` nhưng artwork thật (hũ + chữ "LuckyPot") chỉ chiếm **44% chiều cao đó** (226/512px,
+bbox đo được `33 143 991 369`). Đặt `height: 38px` lên `<img>` là scale CẢ khoảng trống vô
+hình đó xuống 38px → logo thật hiển thị chỉ ~17px, còn nhỏ hơn cả bản 26px cũ. Y hệt lỗi đã
+từng gặp và fix ở bộ logo TRƯỚC (hũ vàng+cỏ xanh, xem "VIỆC CÒN DANG DỞ" phía dưới, mục
+`viewBox đã bị crop`) — bộ logo MỚI (hũ+$) này bị lại chính lỗi đó vì là file gốc mới từ
+Desktop, chưa qua bước crop.
+
+**Đã sửa: crop `viewBox` từ `"0 0 1024 512"` sang `"33 143 958 226"`** (đúng bbox đo được,
+không thêm lề) ở cả 3 file — `landing/logo-full.svg`, `landing/logo-full-dark.svg`,
+`src/assets/logo-full-dark.svg`. Không đổi CSS `height: 38px`, chỉ đổi viewBox — giờ 38px
+là chiều cao logo THẬT, không còn khoảng trống ẩn.
+
+**Privy PNG (`privy-logo.png`/`privy-logo-dark.png`) dính lỗi tương tự nhưng KHÔNG sửa được
+hết** — đo `Desktop/privy.svg` gốc (`viewBox="0 0 200 100"`) thấy content thật cũng chỉ
+chiếm 43% chiều cao (bbox `9.6 28.6 190.4 71.4` theo đơn vị viewBox, tỉ lệ ngang/dọc content
+~4,22:1). Đã crop viewBox y hệt cách trên rồi render lại, dàn full chiều rộng khung
+(388/400px) — nhưng khung Privy **BẮT BUỘC tỉ lệ 2:1** (yêu cầu cứng của Privy Dashboard,
+không phải mình tự chừa), mà content lockup lại ngang ~4,2:1, nên nhét vào khung 2:1 thì
+theo đúng hình học content chỉ có thể cao tối đa ~47% khung (dù full chiều rộng) — **đây
+KHÔNG phải bug, là giới hạn hình học không tránh được của tỉ lệ khung Privy**. Đã đẩy hết
+cỡ có thể (full chiều rộng, không chừa lề thừa), không thể to hơn nữa nếu còn giữ đúng 2:1.
+
+⚠️ **Follow-up thứ 2 cùng ngày: đợt crop viewBox ở trên vô tình làm dấu $ trên hũ bị trắng
+luôn, chìm mất trên nền vàng.** User báo: "icon USDC trong chiếc hộp nếu màu trắng sẽ bị
+chìm... chỉ có chữ mới trắng". Nguyên nhân: `fulllogo.svg` có đúng **9 path `fill="black"`**
+— 8 path đầu là 8 chữ cái "LuckyPot" (toạ độ x nằm bên phải, ~200-990), path thứ 9 là dấu
+$ vẽ trên hũ (toạ độ x bên trái, ~90-138, cùng vùng với hũ vàng/xanh). Bản dark ban đầu
+(cả 2 đợt trước) đổi *TẤT CẢ* 9 path `black` sang `#FFFFFF` bằng string-replace toàn cục —
+đúng cho 8 chữ cái, sai cho dấu $ (nó cần đứng yên màu đen để còn tương phản với hũ vàng
+`#FCD34D`, không liên quan gì đến nền tối/sáng của trang).
+
+**Đã sửa: chỉ đổi 8 lần đầu sang trắng, giữ lần thứ 9 (dấu $) nguyên màu đen** — dùng
+`str.split('fill="black"')` rồi ráp lại có chọn lọc, verify bằng `assert` đếm đúng 8 và 1
+trước khi ghi file. Áp dụng cho cả 3 chỗ: `landing/logo-full-dark.svg`,
+`src/assets/logo-full-dark.svg`, và 2 PNG Privy (`privy-logo.png`/`privy-logo-dark.png`,
+`privy.svg` gốc cũng đúng pattern 8 chữ + 1 icon y hệt). Verify bằng screenshot zoom navbar
+thật trên production — dấu $ đen rõ trên nền vàng, chữ trắng trên nền tối.
+
+**Bài học:** khi 1 file SVG có nhiều path cùng màu `black` nhưng đóng vai trò khác nhau
+(chữ vs icon/chi tiết trên mark màu), *không bao giờ* string-replace toàn cục theo màu —
+phải soi toạ độ (x range) từng path để biết path nào thuộc nhóm nào trước khi đổi màu chọn
+lọc. Lỗi này lặp lại 2 lần liên tiếp trong cùng buổi vì lần đầu chỉ sửa viewBox mà không
+soi lại từng path.
+
+---
+
+## Trạng thái nghỉ 2026-08-30 (khuya) — sửa lỗi "Claim now" trên phần thưởng quá 3 ngày
+
+User gửi ảnh chụp modal Privy báo lỗi khi bấm nhận thưởng:
+`Execution reverted with reason: past claim window, use sweep.` — không phải bug ngẫu
+nhiên, đây là **contract hoạt động đúng thiết kế nhưng frontend chưa theo kịp**.
+
+Contract (`LuckyStakerPool.sol`) có 2 đường lấy thưởng tách biệt:
+- `claim(epochId)` — tự bấm, **chỉ trong vòng `SWEEP_DELAY` = 3 ngày** kể từ lúc quay số
+  (`e.drawnAt`). Quá hạn thì revert đúng câu trên.
+- `sweep(epochId)` — permissionless, ai gọi cũng được, mở **sau** 3 ngày, tự động trả cho
+  MỌI người thắng chưa nhận (kể cả người đang gọi). Đây là đường thoát duy nhất sau khi hết
+  hạn claim.
+
+`ResultModal.tsx` (nút "Claim now" trong popup xem kết quả epoch) **trước giờ chỉ biết gọi
+`claim`**, không hề đọc `drawnAt`/`SWEEP_DELAY`, nên với bất kỳ epoch nào thắng mà quá 3
+ngày chưa bấm nhận — kể cả epoch cũ từ mấy tuần trước xem lại trong "My history" — nút vẫn
+hiện "Claim now" và luôn revert.
+
+**Đã sửa** (`ResultModal.tsx` + thêm hook `useSweepDelay()` vào `hooks/usePoolData.ts`):
+đọc `useEpoch(epochId).drawnAt` và `SWEEP_DELAY` từ chain, so với `Date.now()`. Quá hạn thì
+nút đổi thành **"Release prize"** và gọi `sweep` thay vì `claim`, kèm 1 dòng giải thích nhỏ
+("The 3-day self-claim window passed, but your prize is still there — this releases it.").
+Chưa quá hạn thì hành vi y hệt cũ, không đổi gì.
+
+Lưu ý kỹ thuật: `poolAbi` cast thẳng sang `Abi` (không `as const`) nên wagmi không suy được
+kiểu trả về chính xác — theo đúng quy ước sẵn có trong file (`aprBps as bigint | undefined`
+ở `Dashboard.tsx`), phải tự cast `useSweepDelay().data as bigint | undefined`. Không dùng
+`epoch as EpochData` kiểu tương tự vì `useEpoch` đã tự parse tuple thành object có kiểu qua
+`toEpoch()` sẵn trong `usePoolData.ts`.
+
+Đã `tsc -b` sạch, build+deploy, và `grep` xác nhận `"Release prize"` / `"SWEEP_DELAY"` có
+mặt trong bundle production (`index-BCm-kdVo.js`). **Chưa test bằng ví thật** — headless
+Chrome không connect được Privy/MetaMask nên không click thật được nút; cần user tự bấm
+thử trên 1 epoch đã thắng và đã quá 3 ngày để xác nhận `sweep` chạy đúng và tiền về ví.
+
+---
+
+## Trạng thái nghỉ 2026-08-30 (tối) — bộ nhận dạng thương hiệu MỚI thay toàn bộ logo cũ
+
+`main` chưa push lúc viết dòng này, đang chuẩn bị commit ngay sau. Đã deploy live lên
+luckypot.cc, đã verify md5 live = local cho mọi file, đã chụp cả 2 navbar (landing + app).
+
+**Đây là bộ mark HOÀN TOÀN KHÁC** với hũ-vàng-cỏ-xanh của mục "logo mới" bên dưới (viết
+sáng cùng ngày) — chuyện logo đổi 2 lần trong 1 ngày. Mark mới: hũ bo tròn nền xanh lá
+`#3DCF88`, thân hũ vàng `#FCD34D`, dấu USD đen trong vòng tròn ở giữa (không còn cỏ 4 lá).
+User cầm nguyên bộ 4 file từ Desktop, dặn rõ vai trò từng file — **đọc kỹ trước khi tưởng
+nhầm file nào thay file nào**:
+
+| File Desktop  | Vai trò user chỉ định                              | Đích trong repo |
+|---------------|-----------------------------------------------------|-----------------|
+| `favicon.svg` | favicon + apple-touch-icon + **logo đứng lẻ** (mark)| `public/favicon.svg`, `landing/favicon.svg`, `landing/logo.svg`, `src/assets/logo.svg`, + apple-touch-icon.png render lại 180×180 (cả `public/` và `landing/`) |
+| `fulllogo.svg`| logo navbar website (đổi đen→trắng cho nền tối)      | `landing/logo-full.svg` (light, giữ nguyên đen) → tự sinh `logo-full-dark.svg` (light này thay `fill="black"` bằng `#FFFFFF`, đúng 9 chỗ, y hệt cách làm bản cũ) ở cả `landing/` và `src/assets/` |
+| `privy.svg`   | logo cho Privy Dashboard (login-screen logo, "cầm embed thành link") | render PNG `landing/privy-logo.png` (đen) + `privy-logo-dark.png` (trắng) — file này viewBox **200×100 sẵn đúng 2:1**, không cần padding như bộ trước |
+| `pfp.svg`     | lưu để dùng làm PFP app SAU NÀY, KHÔNG wire vào gì hết | `frontend/brand-assets/pfp.svg` — thư mục mới, KHÔNG nằm trong `build-site.mjs`, không lên site, chỉ backup trong git |
+
+`favicon.svg` và `pfp.svg` tự thân đã có nền (bo góc xanh lá / vuông xanh lá đặc), khác bộ
+cũ (mark trong suốt) — nên **không cần bản dark riêng cho 2 file này**, chỉ `fulllogo`/
+`privy` mới cần lật màu vì chữ wordmark của chúng vẽ đen trên nền trong suốt.
+
+Link dán vào ô Logo của Privy Dashboard: `https://luckypot.cc/privy-logo.png` (nếu modal
+Privy để theme dark thì dùng `privy-logo-dark.png`) — xem ghi chú cũ bên dưới, `main.tsx`
+không set `appearance` nên theme modal nằm ở Privy Dashboard, code không biết được.
+
+`build-site.mjs` **KHÔNG cần sửa gì** — chỉ thay NỘI DUNG file, giữ nguyên tên, nên pipeline
+copy cũ vẫn đúng luôn. `_headers` từ mục sửa cache bên dưới cũng ăn theo, nên đổi logo lần
+này KHÔNG bị kẹt cache 4 tiếng như lần trước — verify md5 live = local ngay sau deploy,
+không cần đợi.
+
+`logo.svg` (mark đứng lẻ) và `src/assets/logo.svg` đã cập nhật nội dung theo yêu cầu user,
+nhưng **2 file này hiện KHÔNG được import/dùng ở đâu trong code** (Navbar dùng
+`logo-full-dark.svg`, không dùng `logo.svg`) — giữ nguyên trạng thái "có sẵn nhưng chưa
+wire" đó, không tự ý thêm chỗ dùng mới vì user không yêu cầu.
+
+---
+
+## Trạng thái nghỉ 2026-08-30 — redesign dark theo Privy, logo mới, và MỘT BUG DEPLOY LỚN
+
+`main` = `84dd8ec`, đã push, đã deploy lên luckypot.cc.
+
+### ⚠️ ĐỌC TRƯỚC: lệnh deploy CŨ trong HANDOFF là SAI, và đã sai từ đầu dự án
+
+`wrangler` compile thư mục `functions/` mà nó tìm thấy trong **CWD của chính nó**.
+`functions/` nằm ở **gốc repo**, còn lệnh cũ chạy từ `frontend/` → wrangler đi tìm
+`frontend/functions/`, không thấy, và upload một site **thuần tĩnh không có API**.
+
+Hệ quả: `POST /api/swap` trả **405 với body rỗng** (đó là static asset handler của
+Pages từ chối POST, không phải lỗi code). **Mọi lần deploy của dự án này đều ship
+thiếu API** → nút "sell EURC/cirBTC" chưa bao giờ chạy trên production, với ví nào
+cũng vậy. MetaMask "chạy được" là do test qua `wrangler pages dev` — lệnh đó *có*
+compile functions.
+
+**Deploy đúng: `cd frontend && npm run deploy`** (script mới, tự `cd ..` rồi mới gọi
+wrangler). Deploy thành công phải in ra 2 dòng `Compiled Worker successfully` và
+`Uploading Functions bundle`. Không thấy 2 dòng đó = Functions lại rớt.
+
+Verify nhanh sau mỗi lần deploy:
+
+```bash
+curl -X POST https://luckypot.cc/api/swap -H "Content-Type: application/json" \
+  -d '{"tokenIn":"EURC","tokenOut":"USDC","walletAddress":"0x4672A3B3C14727629107711D9853B52e8E1E26B1","amountBase":"1000000"}'
+```
+
+→ phải trả JSON intent có `executionParams` + `signature`, KHÔNG phải 405.
+`KIT_KEY` đã cấu hình sẵn trên Pages project, không cần set lại.
+
+`build-site.mjs` cũng đã sửa: trước đây nó KHÔNG dọn thư mục gốc `dist-site/`, nên
+file landing bị đổi tên/xoá vẫn nằm lại từ build cũ và ship lên production (chính vì
+vậy `favicon.svg` và `logo-full.svg` cũ vẫn còn sau khi đã xoá khỏi repo). Giờ xoá
+sạch mọi thứ trừ `app/` (vite tự quản thư mục đó).
+
+### ✅ ĐÃ GIẢI QUYẾT — "navbar vẫn ra logo cũ" là CACHE TRÌNH DUYỆT, không phải bug
+
+Kết luận cuối (2026-08-30, sau khi chụp được màn hình thật): **server luôn đúng ngay từ
+đầu.** Cái user nhìn thấy là bản `logo-full.svg` CŨ (cỏ 4 lá xanh gradient, không có hũ
+vàng) nằm trong cache đĩa của trình duyệt họ.
+
+Bằng chứng: `git show b75964a:frontend/landing/logo-full.svg` render ra đúng y hệt ảnh user
+gửi — file đó dùng `fill="url(#paint0_linear_...)"` + 2 `linearGradient`, còn file hiện tại
+dùng `#FCD34D` (hũ) + `#3DCF88` (cỏ), không có gradient nào. File cũ **đã biến mất khỏi
+server**, md5 local ≡ md5 live.
+
+Vì sao kẹt: Cloudflare Pages mặc định cho asset tĩnh `Cache-Control: max-age=14400` (4
+tiếng) mà tên file logo **không có content hash** → đổi logo xong người đã từng vào site
+vẫn thấy bản cũ suốt 4 tiếng, trong khi curl (không cache) báo đúng. Đó là lý do curl và
+mắt user nói ngược nhau 3 lần.
+
+**Đã fix gốc: thêm `frontend/landing/_headers`** đặt `max-age=0, must-revalidate` cho 5 file
+brand không hash tên (favicon, apple-touch-icon, logo, logo-full, logo-full-dark) + 2 PNG
+Privy. `/app/*` KHÔNG đụng tới — vite hash tên nên phải cache dài. `build-site.mjs` copy
+thêm `_headers`. Verify: preview deployment trả `max-age=0` đúng. Domain chính còn dính edge
+cache cũ vài giờ; token Cloudflare trong `EZwallet/.env.txt` **đọc được zone nhưng KHÔNG có
+quyền purge_cache** (trả `Authentication error` code 10000) — muốn purge phải cấp thêm quyền.
+
+### 🖼️ Logo cho Privy dashboard (đã xong)
+
+Privy (Dashboard → login screen → Logo) đòi **URL của một PNG**, khuyến nghị 180x90, tỉ lệ
+**2:1**. Đưa link `.svg` vào nó báo "Logo must be a valid URL". Lockup của mình là 3.6:1
+(180.1/50.1) nên **phải padding vào khung 2:1, tuyệt đối không kéo méo**.
+
+Đã tạo 2 file, nền trong suốt, 360x180 (2:1, 2x cho màn retina), lockup canh giữa:
+
+- `https://luckypot.cc/privy-logo.png` — chữ ĐEN, cho modal Privy theme **light** (mặc định)
+- `https://luckypot.cc/privy-logo-dark.png` — chữ TRẮNG, nếu modal để theme **dark**
+
+⚠️ `main.tsx` KHÔNG set `appearance` trong `PrivyProvider` config → theme modal lấy từ
+Privy Dashboard, đọc source không biết được. Nếu sau này set `appearance.theme` trong code
+thì nhớ đổi luôn logo cho khớp.
+
+Nguồn sinh PNG: `scripts/build-site.mjs` chỉ copy file; PNG được render bằng Chrome headless
+(xem mục công cụ bên dưới) từ chính 2 file SVG trong `landing/`. Muốn tạo lại: dựng 1 trang
+HTML `width:360px;height:180px;display:flex;align-items:center;justify-content:center` bọc
+`<img style="width:340px">`, rồi chụp với `--default-background-color=00000000`.
+
+### 🔧 CHỤP MÀN HÌNH ĐƯỢC RỒI — không cần Playwright
+
+Handoff cũ ghi "không có trình duyệt, chưa verify được". **Sai — máy có sẵn Chrome và dùng
+headless chụp được ngay**, không phải cài gì:
+
+```bash
+"/c/Program Files/Google/Chrome/Application/chrome.exe" --headless=new --disable-gpu   --hide-scrollbars --window-size=1280,900 --virtual-time-budget=15000   --screenshot="C:\duong\dan\out.png" https://luckypot.cc/app
+```
+
+Thêm `--allow-file-access-from-files` nếu trang có `<img src="file:///...">`, và
+`--default-background-color=00000000` để nền trong suốt. Đã dùng để verify cả 2 navbar,
+so file live với file gốc trên Desktop, và render PNG cho Privy. Browser cache của Chrome
+headless là profile tạm nên mỗi lần chạy là một lần load sạch — chính vì vậy nó thấy logo
+mới trong khi trình duyệt user thấy logo cũ.
+
+### Trạng thái các file logo (giữ lại để tham chiếu)
+
+- Nguồn logo là **2 file trên Desktop**: `luckpot-SVG.svg` (chỉ mark, 1.558 bytes) và
+  `luckpot-full.svg` (lockup mark + chữ, 6.323 bytes, mtime 2026-08-30 16:06,
+  md5 `5b012c5dedb1f0464339c2d851b79c65`). Đã quét toàn bộ `C:\Users\Dell` —
+  **chỉ có ĐÚNG 1 bản** `luckpot-full.svg`, không có bản OneDrive nào khác.
+- Repo đang có: `landing/logo.svg` (mark), `landing/logo-full.svg` (chữ đen),
+  `landing/logo-full-dark.svg` + `src/assets/logo-full-dark.svg` (chữ trắng).
+  Bản dark = bản light replace đúng 8 path `fill="black"` sang `#FFFFFF` (bình `#FCD34D`
+  và cỏ `#3DCF88` giữ nguyên; cái `rect fill="white"` trong `clipPath` dùng chuỗi khác
+  nên không bị chạm).
+- **viewBox đã bị crop** từ `0 0 200 100` sang `10 22.2 180.1 50.1`. Lý do: file gốc đặt
+  hình giữa canvas cao gấp đôi, để nguyên thì `height: 26px` render ra hình chỉ ~13px.
+  Bounding box đo bằng sharp trim. **Nếu user muốn giữ nguyên 100% file gốc thì hoàn
+  nguyên chỗ này và bù bằng CSS.**
+- Navbar app (`Navbar.tsx`) + landing đều đã đổi sang `<img src=logo-full-dark.svg>`;
+  cách ghép cũ (mark riêng + chữ "LuckyPot" đánh bằng Space Grotesk) đã xoá, kèm 2 class
+  `.brand__word` / `.brand__mark`.
+- **Verify được từ server**: HTML landing live đúng là
+  `<img src="logo-full-dark.svg" alt="LuckyPot" />`, file trả về có
+  `viewBox="10 22.2 180.1 50.1"` và 8 path `#FFFFFF`; bundle app tham chiếu
+  `assets/logo-full-dark-CAnD0q43.svg`. Render ra đúng lockup bình + chữ trắng.
+- **Nhưng user vẫn báo thấy logo cũ.** Đã hỏi, user chọn "vẫn thấy logo cũ trên site"
+  (không phải phản đối việc crop, không phải chê navbar xấu).
+
+→ Đã xong: nghi ngờ "cache trình duyệt" là đúng, xem mục ✅ ĐÃ GIẢI QUYẾT ở trên.
+**Bài học: khi curl nói ngược với mắt user, đừng curl thêm lần thứ ba — hãy chụp màn hình
+bằng Chrome headless, và nghi cache trước tiên nếu tên file không có content hash.**
+
+Ngoài ra `/logo` và `/logo-dark` là 2 short URL (302 qua `landing/_redirects`) trỏ tới
+`logo-full.svg` / `logo-full-dark.svg`. Đây là hiểu nhầm ban đầu của tôi khi user nói
+"trỏ nó vào luckypot.cc/logo" — user muốn nói *logo của site*, không phải một URL.
+Giữ lại vì vẫn tiện, nhưng không phải cái user yêu cầu.
+
+### Redesign dark — hệ token và typography (đã xong, đã live)
+
+**Font: Inter (UI/body) + Space Grotesk (heading, wordmark, MỌI con số).** Self-host qua
+`@fontsource/inter` + `@fontsource/space-grotesk`, không gọi Google Fonts lúc runtime.
+Biến: `--font-ui`, `--font-display`. `--font-condensed` (Roboto Condensed) đã BỎ khỏi app;
+landing còn giữ tên đó nhưng chỉ là alias trỏ về `--font-display`.
+
+Lý do chọn: docs.privy.io dùng **FFF Acid Grotesk** cho heading (font thương mại họ tự
+host, repo không ship được) + **Inter** cho body. Inter lấy đúng y hệt; Space Grotesk
+đứng thay Acid Grotesk. Muốn đúng bản gốc = mua licence webfont rồi đổi mỗi `--font-display`.
+
+**Thang chữ hạ từ 15/18/22/27 sang `--fs-0..4` = 10/12/14/19/20** (user kêu chữ to, chèn lấn).
+0 = nhãn micro in hoa (tầng mới), 1 = body/UI/nút/dòng list (sàn), 2 = tiêu đề card,
+3 = countdown, 4 = con số lớn nhất của card.
+
+**Màu: lấy nguyên token dark của Privy** để modal login của họ khớp chrome mình.
+`--color-page-bg #000008` · `--color-surface #010110` · `--color-card-bg #16172a` ·
+`--color-elevated #22222a` · `--color-line #333455` · `--color-hair #24253f` ·
+text `#ffffff` / secondary `#cbcde1` / faint `#8b8dab`.
+
+⚠️ **Xanh đổi `#16a34a` sang `#3dcf88`**: xanh cũ (vừa là primary của mình vừa là success
+của Privy) KHÔNG đủ tương phản trên nền gần đen. `#3dcf88` là sắc Privy dùng cho dark.
+Kéo theo: **mọi nút xanh đặc dùng chữ `#04170e`**, không dùng trắng.
+Slab `#ffcc00` cũ thay bằng card amber `#fcd34d` 12% + viền 35%.
+
+**`pill-button--primary/--secondary` đổi tên thành `--quiet/--accent`** — restyle làm đảo
+cái nào đặc cái nào viền, giữ tên cũ là bẫy cho lần sửa sau. `--accent` = xanh đặc (1 hành
+động chính mỗi màn), `--quiet` = nền elevated + viền.
+
+**LƯỚI KHÔNG ĐỔI**: vẫn 50px/hàng, gap 10, bo 15, shell 860/430, 13 hàng đúng thứ tự cũ.
+
+### 3 luật xuống dòng (đừng phá)
+
+1. **KHÔNG bọc chữ trong span có `min-width: 0`** rồi thả vào flex — flex sẽ bóp chữ xuống
+   dưới bề rộng tự nhiên và ngắt dòng dù còn thừa cả trăm px. Đây chính là bug banner user
+   bắt được.
+2. **`text-wrap: pretty` (class `.prose`), KHÔNG dùng `balance`** — `balance` chủ động chia
+   đôi một dòng đang vừa khít. Đó là nửa còn lại của bug banner.
+3. **`.pair` = `white-space: nowrap`** cho cặp số + đơn vị (`1,300.38 USDC`), địa chỉ rút
+   gọn, countdown, và cụm CTA gạch chân.
+
+Banner giờ đúng 3 flex item: icon (`flex: none`) · chữ (`flex: 1 1 auto`) · chevron
+(`flex: none`). Xem `.banner*` trong global.css và `AnnouncementBanner.tsx`.
+
+**MY HISTORY: hàng 50px** (trước 90/100px) — bằng đúng đơn vị của DRAW HISTORY để 2 box kẻ
+ngang trùng nhau. Ngày dời sang cạnh action thay vì chiếm riêng 1 dòng, vừa 5 dòng thay vì
+3. Class `.card-list__row--stacked` đã xoá.
+
+### Copy: "full epoch" chứ không phải "full week"
+
+`deposit()` cộng vào `pendingBalance`; roll-in sang `eligibleBalance` xảy ra trong
+`revealAndDraw`, tức **tại mốc epoch** — mà mốc đó neo Thứ Hai 00:00 UTC (= 7h sáng T2 giờ
+VN). Nên luật là **mốc-tới-mốc**, không phải đếm đủ 7 ngày. Gửi thứ 4 thì chờ hết epoch đó,
+thành ticket ở mốc T2, rồi chạy cho epoch kế. Ai đọc "a full week" mà gửi thứ 7 sẽ tưởng T7
+tuần sau có vé — chuyện đó không bao giờ xảy ra. Đã sửa ở landing (hero, meta description,
+step 2, mục Tickets, mục Yield) và 2 popup của app (`PoolCard`).
+
+⚠️ **Cảnh báo cũ "đừng dùng chữ Monday" trong HANDOFF ĐÃ HẾT HIỆU LỰC** — nó có từ trước
+bản V3 neo lịch (2026-08-25). Giờ nói "Monday 00:00 UTC" là đúng sự thật.
+
+**Copy multisig đã sửa**: dòng "Admin is a 2-of-2 Safe multisig, not a single wallet" bị bỏ
+khỏi danh sách "What never changes" (nó không phải thứ không đổi) và chuyển xuống mục
+"Honest boundaries", nói thẳng là ví đơn vẫn có quyền ngang Safe, chưa siết vì chưa deposit
+vào DeFi thật, và sẽ siết trước khi có tiền thật. User đã duyệt cách diễn đạt này.
+
+### Privy — 2 bug, mức độ chắc chắn KHÁC NHAU
+
+**`VITE_PRIVY_APP_ID` có trong `frontend/.env` nên `USE_PRIVY = true` và production LUÔN
+build cây Privy.** "Dùng MetaMask" thực chất là nối MetaMask *qua* Privy. Không có chuyện
+2 config wagmi khác nhau ở production.
+
+1. **Login email nhưng vào nhầm MetaMask — tìm ra gốc trong source, CHƯA TEST.**
+   `useSyncPrivyWallets.mjs` đăng ký 1 wagmi connector cho MỖI ví rồi gọi `reconnect()`,
+   mà `reconnect()` khôi phục theo `recentConnectorId` trong localStorage — key này Privy
+   ghi mỗi lần có ví nào connect. Nên một khi MetaMask từng dùng trên trình duyệt đó, mọi
+   lần login email sau đều reconnect thẳng về MetaMask.
+   Fix: truyền `setActiveWalletForWagmi` (prop có sẵn, chưa bao giờ truyền) trong `main.tsx`
+   — `pickActiveWallet` ưu tiên ví `walletClientType === "privy"`. Vì
+   `createOnLogin: "users-without-wallets"`, ví embedded chỉ tồn tại với người đăng ký
+   KHÔNG có ví, nên "ưu tiên embedded" = "dùng đúng ví vừa login". Truyền prop này cũng làm
+   Privy bỏ luôn việc ghi `recentConnectorId` (`a || (...)` trong source), nên đường storage
+   cũ bị gỡ chứ không phải bị lấn át. **KHÔNG cần xoá site data.**
+   Trường hợp chưa cover: tài khoản tạo bằng email VÀ đã link MetaMask sẽ luôn bị ép vào
+   embedded, không có cách đổi trong app. Có thể thêm nút đổi ví trong dropdown navbar
+   (`useWallets` + `useSetActiveWallet`, khoảng 20 dòng) — user chưa duyệt.
+
+2. **Nút sell không chạy — GỐC THẬT chính là bug deploy 405 ở đầu mục này.** Không liên
+   quan Privy chút nào. Hai thứ tôi sửa trước đó (chặn khi ví 0 USDC vì USDC là gas token
+   của Arc; truyền `account` + `chainId` tường minh cho `sendTransaction`) là lỗi thật và
+   nên giữ, **nhưng KHÔNG phải nguyên nhân** — tôi đã nói sai với user chỗ này.
+
+### RPC 429
+
+Console user ngập `429` từ `rpc.testnet.arc.io`. `multicall3` vốn đã cấu hình nên các hook
+nhiều contract chỉ tốn 1 call, nhưng các read đơn lẻ cộng lại vẫn bắn khoảng 8 request cùng
+lúc lúc mount, rồi react-query retry mỗi cái 3 lần. Đã sửa: transport
+`http(undefined, { batch: true })` ở cả 2 config (gộp eth_call cùng tick vào 1 POST), và
+QueryClient hạ `retry: 1`, `staleTime: 10_000`, `refetchOnWindowFocus: false`.
+
+### Chưa verify được (cập nhật 2026-08-30 chiều)
+
+**ĐÃ verify bằng Chrome headless** (xem mục 🔧 ở trên): 2 navbar hiện đúng logo mới, landing
++ /app render đúng theme dark, banner không xuống dòng vô lý, `POST /api/swap` trên
+production trả **HTTP 200** kèm intent đầy đủ (bug 405 đã hết thật).
+
+Còn lại phải có người thật bấm (headless không login ví được): **luồng Privy
+login-email → faucet → sell**, tức là fix Privy #1 bên dưới vẫn CHƯA test thật.
+
+Rasterize SVG: dùng Chrome headless (mục 🔧) — không cần `sharp`, không cần ImageMagick.
+
+---
+
+## HỆ LƯỚI GIAO DIỆN — đọc trước khi đụng vào bất kỳ layout nào
+
+User rất khắt khe về lưới; đã phải dựng lại 2 lần vì làm sai. **Luật bất di bất dịch:**
+
+- **1 hàng = `--row-h` = 50px CỐ ĐỊNH, giống hệt nhau ở cả desktop lẫn mobile.** User đã cân nhắc và **chọn px cố định thay vì tỉ lệ màn hình** (`1fr`/`vh`), chấp nhận đánh đổi: desktop cần `15×50 + 14×10 = 890px` chiều cao, cửa sổ thấp hơn thì **cuộn**, tuyệt đối không bóp hàng nhỏ lại. **ĐỪNG đổi về `1fr`/`vh`.**
+- **Khe giữa hàng 10px** (`--gap`), **box bo góc 15px**.
+- **Desktop = 860px** (đúng x2 mobile 430px — user chốt, khác spec ghi 1290). Ngoài khung đổ nền xám `--color-page-bg`, KHÔNG bao giờ giãn full màn hình.
+- **Desktop 15 hàng:** 1 navbar · 2 banner · 3-6 EPOCH(1/3) | TOTAL POOL(2/3) · 7-14 DRAW HISTORY(2/3) | MY HISTORY(1/3) · 15 trống.
+- **Mobile 13 hàng:** 1 navbar · 2 banner · 3-6 EPOCH · 7-10 POOL · 11 nút DRAW HISTORY · 12 nút MY HISTORY · 13 trống. Hai box history **thu thành nút 1 hàng, bấm mở popup** (để trang mobile không dài lê thê).
+- **KHÔNG có padding dọc ở lưới trang** (`padding: 0 20px`) — hàng 1 phải bắt đầu từ đúng mép trên trang, nếu không dải trắng phía trên bị mắt hiểu là một phần hàng 1 và navbar trông như bị đẩy xuống dưới tâm. Khoảng trắng đáy do hàng cuối (trống) đảm nhiệm.
+- **Trong box:** nội dung chia **4 hàng bằng nhau + khe 10px**, mỗi yếu tố 1 hàng (EPOCH: mô tả chiếm 2 hàng cuối).
+- **Đường kẻ dưới navbar dùng `box-shadow`, KHÔNG dùng `border-bottom`** — border nằm trong hộp nên đẩy nội dung lệch tâm 0.5px.
+- **Thang chữ 33/28/23/18/13** (`--fs-1..5`) + **`--fs-caption: 15px` riêng cho chú thích** (nằm ngoài thang). Đã giảm đồng loạt 2pt so với thang gốc 35/30/25/20/15 ngày 2026-08-24, theo yêu cầu user — giữ đúng tỉ lệ tương đối giữa các bậc. Chỉ dùng biến, không tự chế cỡ.
+- **Header của box: 20px, BOLD, Roboto Condensed**, có **đường kẻ ngăn với nội dung** (`.box-header` / `.card-list__header`, vẽ bằng `box-shadow`). Nội dung số liệu cũng dùng Condensed (`--font-condensed`).
+- **Trong box KHÔNG có padding trên** (`padding: 0 20px 20px`) — user chốt sau khi thử.
+- Cách kiểm tra: đừng tin mắt, mở Playwright đo `getBoundingClientRect` / `gridTemplateRows` rồi so số (xem mục "Bài học" bên dưới).
+
+---
+
+## Tổng hợp — những việc lớn CHƯA từng ghi vào HANDOFF (bổ sung 2026-08-25)
+
+Các việc này đã làm xong và push từ trước nhưng chưa được note lại ở đây:
+
+- **Rebrand LuckyStaker → StableLuck → LuckyPot (tên CUỐI CÙNG).** Đổi tên repo GitHub,
+  text trong app, package name, localStorage key prefix (`luckypot:...`), 2 lần liền —
+  contract Solidity vẫn giữ tên cũ `LuckyStakerPool.sol` (xem cảnh báo đầu file).
+- **Landing page mới** ở `frontend/landing/index.html` — file HTML tĩnh riêng, KHÔNG qua
+  Vite build, đọc dữ liệu on-chain thật bằng `viem` import trực tiếp từ `esm.sh` (không
+  cần bundler vì đây không phải React app). Domain `luckypot.cc` trỏ root vào landing,
+  `/app` vào dashboard React — cấu hình bằng `vite.config.ts` (`base: "/app/"`,
+  `build.outDir: "dist-site/app"`) + script `frontend/scripts/build-site.mjs` copy landing
+  vào `dist-site/` sau khi build app. Lệnh build đúng giờ là `npm run build:site`
+  (KHÔNG PHẢI `npm run build` — lệnh đó chỉ build app, thiếu landing).
+  - Domain `luckypot.cc` gắn qua Cloudflare API trực tiếp (không có `wrangler pages domain`
+    command ở bản wrangler đang dùng) — token ở `EZwallet/.env.txt` (`CF_API_TOKEN`,
+    `CF_ACCOUNT_ID`), xem lệnh trong lịch sử chat nếu cần gắn domain khác.
+  - Toàn bộ icon (kể cả landing) phải lấy từ `D:\Files\Claude\Icons`, copy vào
+    `frontend/landing/icons/` (landing) hoặc `frontend/src/assets/icons/` (app) — **không
+    dùng ký tự unicode/emoji giả icon** (đã từng sai với "✕", "↓", dấu "+/–" ở accordion,
+    user nhắc rất gắt vụ này).
+  - Logo chính thức `luckypot.svg` (lọ vàng + lá tứ diệp xanh, 2 màu — dùng thẳng `<img>`,
+    KHÔNG dùng kỹ thuật mask 1 màu) — cũng là favicon.svg + apple-touch-icon.png (render
+    bằng Playwright screenshot 180×180 vì máy không có công cụ convert SVG→PNG khác).
+- **Fix bug nghiêm trọng: "Buffer is not defined" khi deposit qua Privy.** Privy SDK +
+  vài dependency wallet-connect của nó cần `Buffer`/`process`/`global` (biến Node.js),
+  Vite (khác webpack) không tự polyfill. Fix bằng `vite-plugin-node-polyfills` trong
+  `vite.config.ts`, scope đúng 3 biến đó.
+- **Modal.tsx giờ render qua React Portal (`createPortal` vào `document.body`)** — trước
+  đó Modal là con trực tiếp của 1 container `display:grid` (dashboard-grid hoặc card's
+  own row-grid), khiến `position:fixed` bị "kẹt" trong ô grid thay vì phủ toàn màn hình
+  → click ra ngoài để đóng popup KHÔNG hoạt động đúng (backdrop chỉ to bằng cái box mở
+  popup đó). Đây là lỗi ẩn ảnh hưởng MỌI popup trong app, không riêng popup nào — đã fix
+  1 lần cho tất cả qua Portal.
+- **`formatUSDC` đổi mặc định `maximumFractionDigits` 0 → 2** — số nguyên vẫn hiện gọn
+  (không thêm `.00` thừa), nhưng số lẻ nhỏ (giải thưởng 0.075 USDC) không còn hiện sai
+  thành "0 USDC".
+- **Icon copy trên navbar giờ animate:** bấm copy địa chỉ → đổi sang `check.svg` màu xanh
+  1.5s rồi tự về lại `copy.svg`.
+- **README.md và PROJECT.md đã viết lại toàn bộ** cho khớp logic mới nhất (yield `aprBps`,
+  chia giải `sqrt`, referral, vault) — README giờ mở đầu bằng core belief thay vì đi thẳng
+  vào cấu trúc thư mục.
+- **Git identity đổi sang tài khoản `still2412`** cho repo này (LOCAL config, không phải
+  global — các project khác của user vẫn dùng KattyFury bình thường). `gh` active account
+  cũng là `still2412`, hiện đã có quyền **admin** trên repo (cấp qua API sau khi UI web
+  không cho đổi role trực tiếp — xem lịch sử chat nếu cần lặp lại thao tác này).
+
+## Trạng thái nghỉ 2026-08-25 — epoch giờ neo đúng lịch Thứ Hai 00:00 UTC
+
+**Upgrade thứ 3 lên proxy** (`0xD2F9562f31eb6a1eA89D296e7a5aBf4a0E3fEA56`, module
+`LuckyStakerPoolV3Implementation.ts`) — chỉ sửa logic `revealAndDraw`, KHÔNG thêm
+biến mới nên không cần `initializeV2`/reinitializer, upgrade bằng
+`upgradeToAndCall(newImpl, "0x")` (data rỗng).
+
+- **Vấn đề cũ:** `epochs[currentEpochId].endTime = block.timestamp + 7 ngày` —
+  tính theo giờ bot thực sự gọi `revealAndDraw`, nên trôi dần theo thời gian,
+  không neo theo lịch dương.
+- **Fix:** `newStart = epoch_cũ.endTime` (không phải `block.timestamp`) +
+  `newEnd = _nextMondayUTC(newStart)` — hàm mới `_nextMondayUTC()` tính đúng
+  0h00 UTC Thứ Hai kế tiếp (Unix epoch 0 = Thứ Năm, nên `weekday = (ngày + 3) % 7`
+  với Thứ Hai = 0). Vì dùng `endTime` CŨ làm gốc (không phải giờ thực), epoch đầu
+  tiên sau upgrade tự "snap" về đúng Thứ Hai gần nhất (dù ngắn hơn 7 ngày), và
+  MỌI epoch sau đó tự động đúng trọn 7 ngày Thứ Hai → Thứ Hai mãi mãi — không
+  cần can thiệp gì thêm.
+  - ⚠️ **`forceEndEpoch()` phá chuỗi neo lịch này** — nó ghi đè `endTime = now`,
+    nên nếu dùng để test nhanh, epoch NGAY SAU đó sẽ lại lệch lịch 1 lần nữa
+    (rồi tự neo lại đúng từ epoch sau nữa). Đây là đánh đổi đã biết của hàm test,
+    không phải bug.
+- **Đã thực hiện thật:** force-end epoch #06 (quay ra 1 người trúng
+  `0x24425EE2...c10`, quỹ 1.300384 USDC) → epoch #07 xác nhận kết thúc đúng
+  **Thứ Hai 31/08/2026, 00:00:00 UTC** (epoch chuyển tiếp, ngắn hơn 7 ngày do bắt
+  đầu giữa tuần) — từ epoch #08 trở đi sẽ luôn trọn 7 ngày Thứ Hai → Thứ Hai.
+  Tiền không suy chuyển: 1,217 USDC trước/sau đều khớp.
+- Test mới `"anchors epoch boundaries to Monday 00:00 UTC..."` verify cả 2 case:
+  epoch đầu tự snap đúng Monday, epoch kế tiếp cách đúng 7×86400 giây.
+
+### Bài học/gotcha đã sửa cùng đợt này
+
+- **`formatUSDC` mặc định `maximumFractionDigits=0`** làm giải thưởng nhỏ
+  (0.075 USDC) hiện thành "0 USDC" — đổi mặc định thành 2, số nguyên vẫn hiện
+  gọn (`toLocaleString` không thêm `.00` thừa vì đây là max, không phải fixed).
+- **Khoản ~9.925 USDC "thừa" vào vault ở epoch #05** — KHÔNG phải bug công thức
+  mới. Epoch 5 đang chạy dở lúc upgrade lần 2 (aprBps) hạ cánh; `pendingYield`
+  khi đó đã tích luỹ sẵn theo công thức CŨ (`max($10, pool×10%/52)`) từ cron
+  chạy trước upgrade. Logic mới đúng nhận phần dư đó là `surplus`, quét vào
+  vault đúng như thiết kế — chỉ là tàn dư 1 lần từ lúc chuyển đổi, đã sạch từ
+  epoch #06. Code hiện không còn `$10`/`MIN_PRIZE` ở bất kỳ đâu (đã grep xác nhận).
+
+## Trạng thái nghỉ 2026-08-24 (tối) — technical-spec upgrade ĐÃ CHẠY THẬT lên chain
+
+**Đã upgrade contract logic thật trên proxy đang chạy** (`0x88dCB2f36356AA8DADdC2e8fb4A3E122Ba9D0Beb`), không redeploy, không mất dữ liệu cũ (verify lại: `balancesTotal=65 USDC`, `currentEpochId=5` giữ nguyên sau upgrade).
+
+- **Implementation mới:** `0x1fEB6ac87f97B2C080d9BbDA940351116A2A54F0`, deploy qua `contracts/ignition/modules/LuckyStakerPoolV2Implementation.ts` (module CHỈ deploy implementation, không đụng proxy — an toàn deploy bất cứ lúc nào).
+- **Logic mới (theo `luckypot-technical-spec.md` user gửi):**
+  - Yield: `aprBpsUSDC` (mặc định 600 = 6%/năm, khung cứng 400–800) và `aprBpsARC` (300 = 3%/năm, khung 200–400), admin set tay qua `setAprBpsUSDC`/`setAprBpsARC`, rate-limit 7 ngày/lần đổi mỗi token. `currentAprBps()` so `poolToken` với `referenceUSDC` (biến mới, KHÔNG hardcode địa chỉ — set lúc `initializeV2`, hiện trỏ đúng USDC thật `0x3600...0000`) để chọn nhánh.
+  - `weeklyPrizePool` chỉ tính trên `eligibleBalance` (đủ 1 tuần); phần dư giữa số đã funding và weeklyPrizePool là `surplus`, tự động chia 50/50 vào `vaultReserve`/`vaultDev` lúc quay số.
+  - `numWinners = max(1, sqrt(eligibleBalance / $1000))` — công thức liên tục, thay hẳn bảng tier cũ.
+  - Referral: `setReferrer()` set 1 lần vĩnh viễn, `claimReferral()` rút riêng. Lúc `claim`/`sweep`, luôn trừ 5% mọi giải — có ref thì vào `pendingRef[ref]`, không thì chia 50/50 vào 2 vault.
+  - `vaultReserve`/`vaultDev` là **bộ đếm `uint256` bên trong contract chính, KHÔNG phải 2 ví ngoài** — quyết định thiết kế quan trọng, lý do: nếu tiền rời contract ngay khi tích luỹ thì điều kiện `whenPaused` trên `withdrawReserve` mất tác dụng (tiền đã ở ví khác, rút được bất kể pause hay không). `withdrawReserve(amount, to, reason)` chỉ chạy khi `paused`; `withdrawDev(amount, to)` rút tự do; cả 2 nhận `to` làm tham số lúc rút, không có địa chỉ ví cố định lưu sẵn.
+  - `forceEndEpoch()` **CỐ Ý GIỮ LẠI** theo yêu cầu user (dự án còn thay đổi nhiều, cần test nhanh) — KHÔNG bị xoá/khoá dù spec gốc đề xuất nên xoá trước khi có tiền thật.
+  - Đề xuất "nút trả hết tiền cho toàn bộ user" (admin-triggered mass refund) đã bị user từ chối — giữ nguyên nguyên tắc cũ: chỉ từng người tự rút, admin không bao giờ đụng được tiền người khác.
+- **`automation/src/fundYield.ts`** đọc `currentAprBps()` thật từ chain để tính `realYieldEarned = balancesTotal × aprBps/10000/52`, bỏ hẳn sàn `$10` cứng cũ.
+- **`frontend/src/lib/prize.ts`** đổi chữ ký `projectedWeeklyYield(eligibleTotal, aprBps)` và `estimateNumWinners(eligibleTotal, weeklyYield)` (trước nhận `poolBalance`/`participantCount`) — khớp công thức sqrt mới, tránh hiện số ước lượng sai/lỗi thời cho người dùng.
+- **`aprBpsUSDC=600`, `aprBpsARC=300`** đã set qua `initializeV2` trong lúc upgrade — verify on-chain đúng.
+
+### Bài học/gotcha mới trong lần upgrade này
+
+- **Admin Safe đổi từ 2-of-2 sang CÓ THÊM 1 admin ví đơn** — user chọn né bớt việc phải dùng Safe UI liên tục khi đang gấp deadline thuyết trình T5. Đã `grantRole(DEFAULT_ADMIN_ROLE, 0xb0ea48A1979326BA9e0b5027D105C8DF9CCAA12E)` — ví này giờ có toàn quyền admin y hệt Safe (`pause`, `setAprBps*`, `withdrawDev/Reserve`, `_authorizeUpgrade`...). **Safe VẪN CÒN giữ quyền admin** (không bị revoke) — chỉ là thêm 1 đường tắt, không phải thay thế hẳn. Cân nhắc: đây là đánh đổi bảo mật thật (1 ví đơn giờ có thể tự ý upgrade contract), chấp nhận được vì đang testnet/tiền test, nhưng **phải xử lý lại đúng chuẩn trước khi có yield/tiền thật** (xem mục Roadmap).
+- **Tính slot lưu implementation ERC1967 nhớ PHẢI trừ 1** (`keccak256("eip1967.proxy.implementation") - 1`), không phải dùng thẳng hash — đã tính sai 1 lần dẫn tới đọc nhầm storage toàn số 0, tưởng upgrade chưa chạy trong khi thực ra chỉ đọc sai slot.
+- **Safe Transaction Builder mất state đã nhập nếu gặp lỗi RPC rồi user rời trang** — giao dịch upgrade đầu tiên bị soạn xong nhưng KHÔNG nằm trong batch cuối cùng được execute (chỉ có `grantRole` chạy thật), phải làm lại từ đầu. Nếu Safe báo "Error connecting to the blockchain" (rate limit RPC công khai), đợi vài phút rồi thử lại thay vì vội chuyển hướng.
+- **MetaMask không inject `window.ethereum` đáng tin cậy trên trang mở kiểu `file://`** — viết 1 trang HTML gọi thẳng `eth_sendTransaction` để 1 ví đơn (không cần Safe) tự gửi giao dịch upgrade, nhưng phải serve qua `http://localhost` (copy vào `frontend/public/`, chạy `npx vite --port 5183 --host`) thì MetaMask mới kết nối được — mở trực tiếp bằng double-click báo "No wallet found" dù đã cài MetaMask.
+- **Confirm (ký đủ ngưỡng) và Execute (đẩy lên chain) là 2 bước khác nhau trong Safe** — dễ nhầm "đủ chữ ký" là "đã xong việc".
+
+### Roadmap — cần làm trước khi có yield/tiền thật (không phải bây giờ)
+
+User đã chốt hướng 2 việc lớn (2026-09-07), thứ tự dưới đây phản ánh đúng ý đó:
+
+1. **Tích hợp Chainlink VRF thật để tăng trust cho cơ chế xổ số** — thay commit-reveal
+   tự chế hiện tại (`commitRandom`/`revealAndDraw`, trộn `blockhash` — xem PROJECT.md
+   mục 4). Randomness hiện tại là tự viết, KHÔNG phải VRF, dù đã đúng hướng tránh
+   `PREVRANDAO` (Arc docs xác nhận luôn trả `0`, khuyên "use an oracle or VRF" — xem
+   `/arc/references/evm-differences`). Điểm yếu thật: keeper (bên duy nhất giữ secret)
+   biết `blockhash` trước khi reveal, có thể tính trước kết quả off-chain rồi CHỌN
+   không gửi tx nếu bất lợi ("last-revealer bias") — rủi ro có thật vì chỉ 1 bên giữ
+   quyền reveal, không phải mạng nhiều node độc lập như VRF thật. Đã tra
+   `/arc/tools/oracles` (2026-09-07): Chainlink, Chronicle, Pyth, RedStone, Stork đều
+   là **price oracle**, không có VRF chuyên biệt nào được xác nhận đã deploy sẵn trên
+   Arc Testnet trong docs — bước đầu tiên khi làm việc này là tự kiểm tra Chainlink VRF
+   (sản phẩm riêng, khác Data Feeds) đã có VRF Coordinator trên chain `5042002` chưa,
+   rồi mới thiết kế lại `revealAndDraw` theo đúng flow request/fulfill của VRF. Chấp
+   nhận được cho testnet/demo hiện tại (giải nhỏ, chưa audit, chưa mainnet).
+2. **Sau mainnet: tích hợp yield thật + viết lại contract + siết quyền admin về đúng
+   chuẩn multisig** — 3 việc đi cùng nhau vì đều chỉ đáng làm khi có tiền thật quy mô
+   lớn, không phải bây giờ:
+   - Yield thật: `IYieldSource` interface đã khai báo sẵn trong contract nhưng chưa có
+     implementation — chờ Arc có nguồn DeFi thật đáng tin (xem thêm điều tra Vitael ở
+     mục "Kế hoạch dùng lending thật của Vitael" phía trên — quyết định lúc đó là CHƯA
+     tích hợp vì còn testnet + lãi quá thấp, có thể đổi lại sau mainnet).
+   - Viết lại contract: bản hiện tại (`LuckyStakerPool.sol`) được thiết kế/vá dần qua
+     nhiều lần nâng cấp UUPS trên testnet (V2→V5, deploy lại từ đầu 2026-08-31) — sau
+     mainnet nên viết lại sạch từ đầu theo đúng kiến trúc yield thật + VRF thay vì tiếp
+     tục vá lên nền cũ.
+   - Multisig: đưa quyền admin về lại ĐÚNG chuẩn (thu bớt quyền ví đơn `0xb0ea48A1...`,
+     đảm bảo Safe 2-of-2 là nơi quyết định cuối cùng) trước khi bật yield thật/nhận tiền
+     thật quy mô lớn — hiện ví đơn đang có quyền ngang Safe chỉ vì tiện test trên
+     testnet (xem PROJECT.md mục 4, Quản trị).
+
+## Trạng thái nghỉ 2026-08-24 — repo chuyển Private, TOTAL POOL đổi sang eligible/total thật
+
+- **Repo đã chuyển từ Public sang Private** (`gh repo edit --visibility private --accept-visibility-change-consequences`) — user không muốn lộ sớm vì thấy dự án tiềm năng. **Hệ quả cần nhớ:** GitHub Pages/Actions dùng repo private vẫn chạy bình thường (đã có secrets sẵn), nhưng link repo không còn xem công khai được nữa — nếu sau này cần mời ai xem thì phải add làm collaborator (giống `still2412`), không share link suông được nữa. `still2412` (đã là collaborator từ trước) vẫn giữ quyền truy cập bình thường khi repo private.
+- **TOTAL POOL đổi cách hiển thị:** từ `"685 USDC/3 depositors"` sang `"eligible/total USDC"` (vd `65/685 USDC`) — bỏ số depositor vì box EPOCH đã hiện participant count rồi, tránh trùng lặp. Số eligible **cộng thật từ on-chain** (`eligibleBalance(address)` của từng participant trong mảng `participants`, không có getter tổng sẵn nên phải tự cộng ở frontend — xem `useEligiblePoolTotal()` trong `hooks/usePoolData.ts`). Có icon `info.svg` (mask-image, cùng kỹ thuật `copy.svg`/`back.svg`) mở popup giải thích: tổng pool luôn an toàn/rút được, phần eligible là phần đã nằm đủ 1 epoch (7 ngày) nên được tính vé; tiền mới gửi tự cuộn vào eligible ở lần quay kế tiếp; khuyên gửi ngay sau khi vừa quay để được tính đủ tuần ngay.
+  - ⚠️ **Epoch KHÔNG neo theo lịch dương** (không phải "luôn bắt đầu/kết thúc đúng 0h UTC thứ Hai") — nó chạy cuốn chiếu 7 ngày kể từ lần `revealAndDraw()` trước đó. Nội dung popup viết đúng theo cơ chế thật này, **không** dùng chữ "thứ Hai" như yêu cầu ban đầu của user vì sẽ sai sự thật.
+- **Toggle `USDC | $ARC` giờ đã KHOÁ nút `$ARC`** (`disabled`, mờ đi, có tooltip "chưa launch") — trước đó bấm vào chỉ đổi nhãn còn số vẫn là USDC (gây hiểu lầm), user xác nhận nên khoá hẳn thay vì để bấm được.
+- Đã build + typecheck + test bằng Playwright thật trên `vite preview` (đọc số liệu on-chain thật `65/685`, không phải giả lập) trước khi deploy. Deploy Cloudflare Pages + push GitHub commit `0d0b3c5`.
+
+## Lịch sử tóm tắt (chi tiết đầy đủ nằm trong git log / chat cũ nếu cần đào lại)
+
+- **2026-08-23:** Deploy thật đầu tiên lên Arc Testnet, dựng xong toàn bộ UI theo spec,
+  luồng cào thẻ/claim/sweep. `still2412` được mời làm collaborator (write), sau đó
+  (08-25) nâng lên admin và trở thành tài khoản `gh`/git chính cho repo này.
+- **2026-08-24 → 08-25:** Rebrand 2 lần (→ StableLuck → LuckyPot), chuyển repo Private,
+  nâng cấp contract 3 lần (technical-spec yield/prize/referral/vault → Monday-anchor
+  epoch), thêm landing page + domain `luckypot.cc`, fix hàng loạt bug UI (xem mục
+  "Tổng hợp" phía trên).
+- **Việc còn treo, chưa khẩn:**
+  1. Siết lại quyền admin về đúng chuẩn Safe 2-of-2 (hiện có thêm 1 ví đơn ngang quyền,
+     xem mục Roadmap ở section Monday-anchor phía trên) — trước khi có tiền/yield thật.
+  2. `IYieldSource` interface đã khai báo, chưa có implementation thật (chờ Arc có DeFi
+     đáng tin).
+  3. Banner cảnh báo `$ARC isn't live yet...` là tự thêm, chưa hỏi lại user có muốn giữ
+     nguyên câu chữ đó không (giờ toggle $ARC đã khoá cứng nên banner này gần như không
+     bao giờ hiện nữa — có thể coi là hết cần thiết).
+
+---
+
+## Stack & địa chỉ quan trọng (Arc Testnet)
+
+| | |
+|---|---|
+| Chain ID | `5042002` |
+| RPC | `https://rpc.testnet.arc.io` |
+| Explorer | `https://testnet.arcscan.app` |
+| USDC (ERC-20, cũng là gas token) | `0x3600000000000000000000000000000000000000` |
+| Multicall3From (batch approve+deposit 1 chữ ký) | `0x522fAf9A91c41c443c66765030741e4AaCe147D0` |
+| **LuckyStakerPool (proxy, dùng địa chỉ này)** | `0x88dCB2f36356AA8DADdC2e8fb4A3E122Ba9D0Beb` |
+| Admin Safe (2-of-2) | `0x0f5514fCA02b639229528a5521dafd0a61bb27ef` |
+| Ví bot (deploy + keeper) | `0x4672A3B3C14727629107711D9853B52e8E1E26B1` |
+
+## Bài học/gotcha phát hiện lúc build (đừng lặp lại)
+
+- **OpenZeppelin Contracts Upgradeable v5.6 đã bỏ `ReentrancyGuardUpgradeable`** — dùng `ReentrancyGuardTransient` (từ package `@openzeppelin/contracts` KHÔNG PHẢI `-upgradeable`) + bắt buộc set `evmVersion: "cancun"` trong `hardhat.config.ts`.
+- **`UUPSUpgradeable` v5 cũng bỏ luôn `__UUPSUpgradeable_init()`** — gọi hàm này trong `initialize()` sẽ báo lỗi "Undeclared identifier".
+- **Hardhat 2.x + `hardhat-toolbox-viem` chạy test bằng Mocha, KHÔNG PHẢI `node:test`** — lỡ `import { describe, it } from "node:test"` sẽ làm mọi test bị bỏ qua âm thầm (`0 passing`, không báo lỗi gì).
+- **Privy: nếu `appId` rỗng/không hợp lệ, `PrivyProvider` sẽ crash TOÀN BỘ app** — đã tự viết `USE_PRIVY` flag (`frontend/src/config/authMode.ts`) để chọn giữa cây Provider có Privy và cây plain wagmi + injected connector (MetaMask).
+- **gh CLI token của KattyFury thiếu quyền `workflow` mặc định** — push file trong `.github/workflows/` bị GitHub từ chối cho tới khi chạy `gh auth refresh -h github.com -s workflow`.
+- **Hardhat Ignition `deploy` hỏi xác nhận `(y/N)` trên terminal không tương tác** — không có flag `--yes`, phải pipe `echo "y" |` vào lệnh.
+- **Frontend đọc dữ liệu on-chain qua react-query là bất đồng bộ** — chụp screenshot ngay sau `domcontentloaded` sẽ thấy giá trị rỗng dù mọi thứ đúng; phải đợi vài giây cho RPC round-trip.
+- **Root `package.json` với `"workspaces"` làm `npm install` trong subfolder tự động hoist lên node_modules gốc**, gây lệch state lockfile. Đã bỏ hẳn — mỗi subfolder cài đặt độc lập.
+- **Đổi tên contract Solidity đã deploy = phải redeploy toàn bộ**, không có cách "sửa tên" tại chỗ.
+- **Epoch 7 ngày/sweep 3 ngày là hằng số cứng trong contract → không test nhanh được vòng lặp commit-reveal thật.** Thay vì đổi thời lượng epoch (phức tạp, ảnh hưởng epoch đang chạy dở), giải pháp gọn hơn: thêm hàm `forceEndEpoch()` cho keeper gọi để kết thúc epoch ngay sau khi đã commit — không đổi logic random/fairness gì cả (keeper vẫn không đoán trước được blockhash lúc reveal), chỉ bỏ qua bước CHỜ.
+
+### Bài học về LAYOUT (đây là chỗ tốn nhiều thời gian nhất, đọc kỹ)
+
+- **ĐỌC SPEC §5 TRƯỚC KHI SỬA LƯỚI.** Đã tự chế "20 hàng" trong khi spec ghi rõ **15 hàng**, làm hỏng bản desktop vốn đang đúng. User cực kỳ khó chịu chuyện này.
+- **Đừng vá layout bằng padding/margin tuỳ hứng.** Mỗi lần "sửa nhẹ" kiểu đó là layout hỏng thêm một chỗ khác. Phải có hệ lưới khai báo rõ (xem mục "HỆ LƯỚI GIAO DIỆN" ở đầu file) rồi sửa trong hệ đó.
+- **`grid-template-rows: repeat(N, 5vh)` + `gap` sẽ TRÀN quá màn hình** — `N×5vh` đã bằng 100vh rồi, cộng thêm gaps là vượt. Đây là lỗi làm box bị kéo dài lê thê.
+- **Đừng dùng 2 đơn vị khác bản chất cho cùng 1 khái niệm.** Từng để desktop dùng `1fr` (co theo cửa sổ) còn mobile dùng `60px` (cố định) → đặt 2 màn cạnh nhau thấy hàng cao thấp khác nhau. User bắt được ngay.
+- **Padding dọc trong box làm hàng con lệch khỏi hàng của trang.** Box cao 4 hàng = `4×50+3×10=230px`; chia trong `(230−40)/4` mà không có khe thì trôi dần.
+- **Phần tử grid không được gán `grid-column` sẽ tự đẻ cột ngầm.** 2 nút history mobile quên ẩn trên desktop → grid sinh cột thứ 4, bóp 3 cột chính từ 266px còn 202px làm chữ tràn. Ẩn/hiện theo breakpoint phải chú ý **thứ tự khai báo CSS**: `.history-button{display:flex}` nằm sau media query nên đè `display:none` (cùng specificity) — phải scope `.dashboard-grid > .g-...-btn` cho thắng.
+- **`border-bottom` làm lệch tâm khi căn giữa.** Border nằm trong hộp (`box-sizing: border-box`) nên nuốt 1px chiều cao content → nội dung lệch lên 0.5px. Dùng `box-shadow: 0 1px 0` để vẽ đường kẻ mà không chiếm chỗ.
+- **Padding dọc ở lưới TRANG làm navbar trông như bị đẩy xuống đáy** dù nó có căn giữa đúng trong ô của nó — vì dải trắng phía trên mắt hiểu là một phần hàng 1. Hàng 1 phải chạm mép trên trang.
+- **ĐO, ĐỪNG ĐOÁN.** Cách hiệu quả nhất trong phiên này là viết script Playwright in ra `gridTemplateRows`, `getBoundingClientRect`, và so tâm phần tử với tâm dải nhìn thấy. Vài lần suýt sửa nhầm chỗ vì đoán mò. Lưu ý `Number("62px")` → `NaN`, phải `parseFloat`.
+
+## Việc tiếp theo khi quay lại (user hẹn làm tiếp tối 2026-08-23)
+
+0. **Việc UI còn dở / cần user chốt:**
+   - **Dropdown ví chưa ai nhìn thấy bằng ảnh** — nó chỉ hiện khi có ví kết nối, mà Playwright không lái được MetaMask. Cần user bấm thử xem nền đen + chữ đã ổn chưa.
+   - **Banner cảnh báo khi bật $ARC** (xem mục UI ở trên) là tôi tự thêm, chưa được user duyệt.
+   - `($ deposited)` cạnh MY TICKETS: user chốt dùng ký hiệu `$` ở đây trong khi mọi chỗ khác đã đổi sang `USDC` — cố ý, đừng "sửa cho đồng bộ".
+1. Dùng `npm run draw:now` (trong `automation/`) để test nhanh — không cần chờ epoch thật.
+2. **Test bằng ví thật** các luồng chưa verify được tự động: auto switch mạng, dropdown ví, highlight "You", cào, claim.
+3. Theo dõi `still2412` đã accept lời mời GitHub collaborator chưa.
+4. Trước khi có depositor thật: cân nhắc khoá lại `forceEndEpoch` (xem mục cảnh báo ở trên).
+
+## Lệnh hay dùng
+
+```bash
+# frontend (D:\Files\Claude\Build on Arc\LuckyStaker\frontend — thư mục local CHƯA đổi tên, bị khoá bởi VS Code lúc rebrand 2026-08-24, tự đổi tay nếu muốn)
+npx vite --port 5183 --host        # dev server (chỉ phục vụ app, KHÔNG có landing page)
+./node_modules/.bin/tsc -b --noEmit  # typecheck (đừng dùng `npx tsc`, npx kéo nhầm gói tsc rác)
+npm run build:site                 # build app + copy landing vào dist-site/ — dùng lệnh này, KHÔNG dùng `npm run build` suông
+# DEPLOY: chay tu GOC REPO, khong phai tu frontend/ — wrangler compile thu muc
+# functions/ tim thay trong CWD cua no, ma functions/ nam o goc. Chay tu frontend/
+# thi Functions KHONG duoc upload, /api/swap tra 405 (static handler tu choi POST).
+# Dung script cho chac: (tu frontend/) npm run deploy
+cd .. && npx wrangler pages deploy frontend/dist-site --project-name=luckypot --branch=main --commit-dirty=true
+
+# gắn/kiểm tra domain luckypot.cc (không có lệnh wrangler cho việc này, phải gọi API)
+# xem CF_API_TOKEN/CF_ACCOUNT_ID trong D:\Files\Claude\Build on Arc\EZwallet\.env.txt
+
+# contracts — deploy CHỈ implementation mới (an toàn, không đụng proxy đang chạy):
+npx hardhat test
+echo "y" | npx hardhat ignition deploy ignition/modules/LuckyStakerPoolV<n>Implementation.ts --network arcTestnet --deployment-id luckypot-v<n>-impl
+# rồi tính calldata upgradeToAndCall + để ví admin (Safe hoặc 0xb0ea48A1...) tự ký qua 1 trang HTML nhỏ gọi eth_sendTransaction (xem lịch sử chat để lấy lại mẫu)
+
+# automation
+npm run fund-yield && npm run draw:now   # draw:now cần secret local, nếu epoch đã commit bởi cron thì phải trigger `gh workflow run keeper.yml` thay vì draw:now
+```

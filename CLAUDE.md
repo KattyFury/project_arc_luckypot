@@ -62,6 +62,6 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ---
 
-Lời dặn cuối: Luôn đọc file này khi tôi yêu cầu login vào dự án, sau đó pull từ git về, khi làm việc xong nhớ push lên git lại.
+Final note: always read this file when I ask to log in to the project, then pull from git, and push when done.
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
